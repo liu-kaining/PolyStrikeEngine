@@ -2,7 +2,7 @@ pub mod guard;
 pub mod inventory;
 pub mod watchdog;
 
-pub use guard::RiskGuard;
+pub use guard::{BudgetReservation, RiskGuard};
 pub use inventory::InventoryManager;
 #[allow(unused_imports)]
 pub use inventory::MarketExposure;

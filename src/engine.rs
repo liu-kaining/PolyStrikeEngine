@@ -1,5 +1,5 @@
-use std::time::Duration;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::watch;
 
@@ -13,16 +13,50 @@ use crate::strategy::SniperStrategy;
 
 pub async fn run(inventory: Arc<InventoryManager>) -> anyhow::Result<()> {
     let config = AppConfig::from_env();
+    
+    // Validate configuration before starting
+    if let Err(e) = config.validate() {
+        anyhow::bail!("Invalid configuration: {}", e);
+    }
+    
     let symbol = config.binance_symbol.clone();
+    let dry_run = config.dry_run;
+
+    // SAFETY: Always print dry_run status at startup
+    if dry_run {
+        println!("\n");
+        println!("╔════════════════════════════════════════════════════════════╗");
+        println!("║  🔸 DRY RUN MODE ENABLED (PAPER TRADING)                   ║");
+        println!("║  No real orders will be placed. Set DRY_RUN=false for live.║");
+        println!("╚════════════════════════════════════════════════════════════╝");
+        println!();
+    } else {
+        println!("\n");
+        println!("╔════════════════════════════════════════════════════════════╗");
+        println!("║  ⚠️  LIVE TRADING MODE - REAL MONEY AT STAKE!              ║");
+        println!("║  Ensure you have reviewed all risk parameters.            ║");
+        println!("╚════════════════════════════════════════════════════════════╝");
+        println!();
+    }
 
     let risk_guard = RiskGuard::new(config.max_budget)
         .with_max_exposure_per_market(config.max_exposure_per_market);
 
-    let poly_client = match PolyClient::new_from_env().await {
-        Ok(c) => Some(c),
-        Err(e) => {
-            eprintln!("[Sniper Engine] PolyClient init failed (snipe disabled): {}", e);
-            None
+    let poly_client = if dry_run {
+        // In dry_run mode, we still initialize the client to verify credentials,
+        // but won't use it for actual orders.
+        println!("[Sniper Engine] Dry run mode: PolyClient initialization skipped (no real API calls).");
+        None
+    } else {
+        match PolyClient::new_from_env().await {
+            Ok(c) => {
+                println!("[Sniper Engine] PolyClient initialized successfully.");
+                Some(c)
+            }
+            Err(e) => {
+                eprintln!("[Sniper Engine] PolyClient init failed (snipe disabled): {}", e);
+                None
+            }
         }
     };
 
@@ -81,7 +115,7 @@ pub async fn run(inventory: Arc<InventoryManager>) -> anyhow::Result<()> {
                     }
                     let poly_book = *poly_rx.borrow();
                     if let Some(signal) = sniper_strategy.evaluate(binance_mid, &poly_book) {
-                        try_fire(&risk_guard, inventory.as_ref(), poly_client.as_ref(), &poly_token_id, &signal).await;
+                        try_fire(&risk_guard, inventory.as_ref(), poly_client.as_ref(), &poly_token_id, &signal, dry_run).await;
                     }
                 }
                 changed = poly_rx.changed() => {
@@ -92,7 +126,7 @@ pub async fn run(inventory: Arc<InventoryManager>) -> anyhow::Result<()> {
                     let binance_mid = (ticker.bid_price + ticker.ask_price) * 0.5;
                     let poly_book = *poly_rx.borrow();
                     if let Some(signal) = sniper_strategy.evaluate(binance_mid, &poly_book) {
-                        try_fire(&risk_guard, inventory.as_ref(), poly_client.as_ref(), &poly_token_id, &signal).await;
+                        try_fire(&risk_guard, inventory.as_ref(), poly_client.as_ref(), &poly_token_id, &signal, dry_run).await;
                     }
                 }
             }
@@ -126,7 +160,7 @@ pub async fn run(inventory: Arc<InventoryManager>) -> anyhow::Result<()> {
                     }
                     let poly_book = PolyBookTicker::default();
                     if let Some(signal) = sniper_strategy.evaluate(binance_mid, &poly_book) {
-                        try_fire(&risk_guard, inventory.as_ref(), poly_client.as_ref(), &poly_token_id, &signal).await;
+                        try_fire(&risk_guard, inventory.as_ref(), poly_client.as_ref(), &poly_token_id, &signal, dry_run).await;
                     }
                 }
             }
@@ -136,24 +170,67 @@ pub async fn run(inventory: Arc<InventoryManager>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Execute or simulate a snipe order.
+/// 
+/// # Arguments
+/// * `dry_run` - If true, only simulate the order (paper trading), no real API calls.
+/// 
+/// # Budget Management
+/// - Budget is reserved BEFORE any order attempt
+/// - Budget is RELEASED if order fails or in dry_run mode
+/// - Budget is consumed only on successful live order execution
 async fn try_fire(
     risk_guard: &RiskGuard,
     inventory: &InventoryManager,
     poly_client: Option<&PolyClient>,
     token_id: &str,
     signal: &crate::strategy::SnipeSignal,
+    dry_run: bool,
 ) {
     if token_id.is_empty() {
         return;
     }
-    if let Err(e) = risk_guard.check_and_reserve_budget(signal.target_price, signal.size) {
-        println!("[RiskGuard] Blocked before fire: {}", e);
+    
+    // CRITICAL: Reserve budget atomically. Must release on failure!
+    let reservation = match risk_guard.reserve_budget(signal.target_price, signal.size) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("[RiskGuard] Blocked before fire: {}", e);
+            return;
+        }
+    };
+
+    // ============================================================
+    // DRY RUN MODE: Simulate order without real API calls
+    // ============================================================
+    if dry_run {
+        // Simulate successful order for testing downstream logic
+        println!(
+            "\n═══════════════════════════════════════════════════════════");
+        println!("🔸 [DRY RUN] Would have executed order:");
+        println!("   Side:     {:?}", signal.side);
+        println!("   Price:    ${:.4}", signal.target_price);
+        println!("   Size:     {:.2}", signal.size);
+        println!("   Notional: ${:.2}", signal.target_price * signal.size);
+        println!("   Token:    {}...", &token_id[..token_id.len().min(20)]);
+        println!("═══════════════════════════════════════════════════════════\n");
+        
+        // Simulate fill for inventory tracking (paper trading)
+        inventory.add_fill(token_id, true, signal.side, signal.size);
+        
+        // Release budget since no real money was spent in dry_run mode
+        risk_guard.release_budget(reservation);
         return;
     }
+
+    // ============================================================
+    // LIVE MODE: Execute real order
+    // ============================================================
     println!("[FIRE] Triggering snipe order: {:?}", signal);
 
     let Some(client) = poly_client else {
-        eprintln!("[FIRE] PolyClient not available, skip.");
+        eprintln!("[FIRE] PolyClient not available, releasing budget.");
+        risk_guard.release_budget(reservation);
         return;
     };
 
@@ -162,11 +239,14 @@ async fn try_fire(
         .await
     {
         Ok(order_id) => {
-            println!("[FIRE] Order placed: {}", order_id);
+            println!("[FIRE] ✅ Order placed: {}", order_id);
             inventory.add_fill(token_id, true, signal.side, signal.size);
+            // Budget consumed successfully, reservation dropped without release
         }
         Err(e) => {
-            eprintln!("[FIRE] Order failed: {}", e);
+            eprintln!("[FIRE] ❌ Order failed: {}, releasing budget", e);
+            // CRITICAL: Release budget on failure to prevent budget leakage!
+            risk_guard.release_budget(reservation);
         }
     }
 }

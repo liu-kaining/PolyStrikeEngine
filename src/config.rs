@@ -14,6 +14,9 @@ pub struct AppConfig {
     pub max_exposure_per_market: f64,
     /// Seconds after last local fill to skip REST overwrite during reconciliation.
     pub reconciliation_buffer_seconds: f64,
+    /// Dry run mode: if true, NO REAL ORDERS will be placed (paper trading).
+    /// Default: true (SAFETY FIRST - must explicitly set DRY_RUN=false for live trading).
+    pub dry_run: bool,
 }
 
 impl AppConfig {
@@ -42,6 +45,13 @@ impl AppConfig {
             .and_then(|v| v.parse::<f64>().ok())
             .unwrap_or(8.0);
 
+        // SAFETY: Default to dry_run=true to prevent accidental real trading.
+        // Must explicitly set DRY_RUN=false for live trading.
+        let dry_run = env::var("DRY_RUN")
+            .ok()
+            .map(|v| v.to_lowercase() != "false" && v != "0")
+            .unwrap_or(true);
+
         Self {
             binance_symbol,
             poly_token_id,
@@ -50,6 +60,22 @@ impl AppConfig {
             max_budget,
             max_exposure_per_market,
             reconciliation_buffer_seconds,
+            dry_run,
         }
+    }
+
+    /// Validate configuration before starting the engine.
+    /// Returns an error if any critical configuration is invalid.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.max_budget < 0.0 {
+            return Err("MAX_BUDGET must be non-negative".to_string());
+        }
+        if self.max_exposure_per_market < 0.0 {
+            return Err("MAX_EXPOSURE_PER_MARKET must be non-negative".to_string());
+        }
+        if self.chain_id == 0 {
+            return Err("CHAIN_ID must be a valid chain ID".to_string());
+        }
+        Ok(())
     }
 }

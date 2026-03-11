@@ -1,3 +1,5 @@
+//! Binance WebSocket book ticker stream with robust reconnection logic.
+
 use std::time::Duration;
 
 use futures_util::StreamExt;
@@ -45,10 +47,18 @@ impl TryFrom<BinanceBookTicker> for BookTicker {
     }
 }
 
+/// Maximum number of consecutive connection failures before giving up.
+const MAX_RETRIES: u32 = 10;
+/// Maximum backoff duration in milliseconds.
+const MAX_BACKOFF_MS: u64 = 30_000; // 30 seconds
+
 /// Spawns a dedicated task that maintains a low-latency Binance `@bookTicker` stream.
 ///
 /// Returns a `watch::Receiver<BookTicker>` that always holds the latest tick.
 /// Subscribers get notified only when a new, valid tick is received.
+///
+/// # Panics
+/// Panics after `MAX_RETRIES` consecutive connection failures to alert the main engine.
 pub async fn spawn_binance_book_ticker_stream(
     symbol: &str,
 ) -> anyhow::Result<watch::Receiver<BookTicker>> {
@@ -62,20 +72,28 @@ pub async fn spawn_binance_book_ticker_stream(
 
     tokio::spawn(async move {
         let mut backoff_ms = 500u64;
+        let mut consecutive_failures: u32 = 0;
 
         loop {
             match connect_async(&url).await {
                 Ok((ws_stream, _)) => {
                     eprintln!("[Binance WS] Connected: {}", url);
                     let (_write, mut read) = ws_stream.split();
+                    
+                    // Reset backoff and failure counter on successful connection
                     backoff_ms = 500;
+                    consecutive_failures = 0;
 
                     let mut first_msg = true;
                     let mut parse_fail_logged = 0u32;
+                    
                     while let Some(msg_result) = read.next().await {
                         let msg = match msg_result {
                             Ok(m) => m,
-                            Err(_) => break,
+                            Err(e) => {
+                                eprintln!("[Binance WS] Stream error: {:?}", e);
+                                break;
+                            }
                         };
 
                         let Message::Text(text) = msg else {
@@ -106,17 +124,32 @@ pub async fn spawn_binance_book_ticker_stream(
 
                         let _ = tx.send(ticker);
                     }
+                    
+                    // Stream ended, will retry below
+                    eprintln!("[Binance WS] Stream ended, reconnecting...");
                 }
                 Err(e) => {
-                    eprintln!("[Binance WS] Disconnected or error: {:?}, reconnecting in {}ms", e, backoff_ms);
+                    consecutive_failures += 1;
+                    eprintln!(
+                        "[Binance WS] Connection failed ({}/{}): {:?}, retrying in {}ms",
+                        consecutive_failures, MAX_RETRIES, e, backoff_ms
+                    );
+                    
+                    // CRITICAL: Panic after max retries to alert main engine
+                    if consecutive_failures >= MAX_RETRIES {
+                        panic!(
+                            "[Binance WS] CRITICAL: Max retries ({}) exceeded. \
+                             Check network connectivity or Binance API status!",
+                            MAX_RETRIES
+                        );
+                    }
                 }
             }
 
             tokio::time::sleep(Duration::from_millis(backoff_ms)).await;
-            backoff_ms = (backoff_ms * 2).min(10_000);
+            backoff_ms = (backoff_ms * 2).min(MAX_BACKOFF_MS);
         }
     });
 
     Ok(rx)
 }
-
