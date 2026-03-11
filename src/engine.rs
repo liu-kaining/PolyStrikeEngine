@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::api::strategy_registry::StrategyRegistry;
 use crate::execution::poly_client::PolyClient;
@@ -134,10 +134,12 @@ pub async fn run_sniper_task(
                         }
                     }
                     (PositionState::PendingBuy { .. }, OrderSide::Buy, false) => {
-                        info!(
-                            "[HFT-ENTER] ❌ K={:.0} | Buy failed at {:.3} | Edge:{:.4}",
-                            strike_price, update.price, update.edge_hint,
-                        );
+                        if update.reservation.is_some() || update.size > 0.0 {
+                            info!(
+                                "[HFT-ENTER] ❌ K={:.0} | Buy failed at {:.3} | Edge:{:.4}",
+                                strike_price, update.price, update.edge_hint,
+                            );
+                        }
                         PositionState::Empty
                     }
                     (PositionState::PendingSell { buy_price, .. }, OrderSide::Sell, true) => {
@@ -287,6 +289,9 @@ async fn evaluate_and_act(
             }
 
             if best_ask > 0.0 && buy_edge > ENTER_THRESHOLD {
+                if !risk_guard.can_afford(best_ask, sniper_strategy.snipe_size) {
+                    return;
+                }
                 let signal = crate::strategy::SnipeSignal {
                     side: OrderSide::Buy,
                     target_price: best_ask,
@@ -399,7 +404,7 @@ async fn try_fire(
         match risk_guard.reserve_budget(signal.target_price, signal.size) {
             Ok(r) => Some(Arc::new(r)),
             Err(e) => {
-                info!("[RiskGuard] ⛔ 触发风控拦截：超出预算或单市场敞口。 原因: {}", e);
+                debug!("[RiskGuard] ⛔ Budget rejected (race): {}", e);
                 let _ = fill_tx.send(fail_update(None)).await;
                 return;
             }

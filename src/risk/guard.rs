@@ -142,6 +142,19 @@ impl RiskGuard {
             .unwrap_or(false)
     }
 
+    /// Fast read-only affordability check (no budget mutation).
+    /// Returns true if the budget has room for `price * size`.
+    pub fn can_afford(&self, price: f64, size: f64) -> bool {
+        let cost = match (Decimal::from_f64_retain(price), Decimal::from_f64_retain(size)) {
+            (Some(p), Some(s)) => p * s,
+            _ => return false,
+        };
+        self.current_total_spend
+            .read()
+            .map(|spend| *spend + cost <= self.max_budget)
+            .unwrap_or(false)
+    }
+
     pub fn max_budget_f64(&self) -> f64 {
         dec_to_f64(self.max_budget)
     }
