@@ -1,39 +1,57 @@
 //! In-memory inventory state (memory-first, hot path never blocks on I/O).
-//! Design aligned with [PolyMatrixEngine](https://github.com/liu-kaining/PolyMatrixEngine) `app/core/inventory_state.py`.
 //!
 //! CRITICAL: Uses Decimal internally for precision. Public API accepts f64 for convenience
 //! but converts to Decimal for storage to avoid cumulative precision loss.
+//! All Decimal->f64 conversions use ToPrimitive (zero-allocation) instead of to_string().parse().
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use dashmap::DashMap;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use serde::Serialize;
 
 use crate::models::types::OrderSide;
 
-/// Per-market exposure snapshot: positions + pending buy notional + reconciliation metadata.
-/// All quantities stored as Decimal for exact arithmetic.
+#[inline]
+fn dec_to_f64(d: Decimal) -> f64 {
+    d.to_f64().unwrap_or(0.0)
+}
+
+/// Per-market exposure snapshot for API responses.
 #[derive(Debug, Clone, Serialize)]
 #[allow(dead_code)]
 pub struct MarketExposure {
-    pub yes_qty: f64,          // Serialized as f64 for API compatibility
+    pub yes_qty: f64,
     pub no_qty: f64,
     pub pending_yes_buy_notional: f64,
     pub pending_no_buy_notional: f64,
     pub realized_pnl: f64,
-    pub last_local_fill_timestamp: f64,
+    pub last_local_fill_elapsed_secs: f64,
 }
 
-/// Internal representation with Decimal precision.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct InternalExposure {
     yes_qty: Decimal,
     no_qty: Decimal,
     pending_yes_buy_notional: Decimal,
     pending_no_buy_notional: Decimal,
     realized_pnl: Decimal,
-    last_local_fill_timestamp: f64,
+    /// Monotonic timestamp of last local fill (immune to NTP drift).
+    last_local_fill_at: Option<Instant>,
+}
+
+impl Default for InternalExposure {
+    fn default() -> Self {
+        Self {
+            yes_qty: Decimal::ZERO,
+            no_qty: Decimal::ZERO,
+            pending_yes_buy_notional: Decimal::ZERO,
+            pending_no_buy_notional: Decimal::ZERO,
+            realized_pnl: Decimal::ZERO,
+            last_local_fill_at: None,
+        }
+    }
 }
 
 impl Default for MarketExposure {
@@ -44,7 +62,7 @@ impl Default for MarketExposure {
             pending_yes_buy_notional: 0.0,
             pending_no_buy_notional: 0.0,
             realized_pnl: 0.0,
-            last_local_fill_timestamp: 0.0,
+            last_local_fill_elapsed_secs: f64::MAX,
         }
     }
 }
@@ -52,12 +70,15 @@ impl Default for MarketExposure {
 impl From<InternalExposure> for MarketExposure {
     fn from(inner: InternalExposure) -> Self {
         Self {
-            yes_qty: inner.yes_qty.to_string().parse().unwrap_or(0.0),
-            no_qty: inner.no_qty.to_string().parse().unwrap_or(0.0),
-            pending_yes_buy_notional: inner.pending_yes_buy_notional.to_string().parse().unwrap_or(0.0),
-            pending_no_buy_notional: inner.pending_no_buy_notional.to_string().parse().unwrap_or(0.0),
-            realized_pnl: inner.realized_pnl.to_string().parse().unwrap_or(0.0),
-            last_local_fill_timestamp: inner.last_local_fill_timestamp,
+            yes_qty: dec_to_f64(inner.yes_qty),
+            no_qty: dec_to_f64(inner.no_qty),
+            pending_yes_buy_notional: dec_to_f64(inner.pending_yes_buy_notional),
+            pending_no_buy_notional: dec_to_f64(inner.pending_no_buy_notional),
+            realized_pnl: dec_to_f64(inner.realized_pnl),
+            last_local_fill_elapsed_secs: inner
+                .last_local_fill_at
+                .map(|t| t.elapsed().as_secs_f64())
+                .unwrap_or(f64::MAX),
         }
     }
 }
@@ -82,19 +103,11 @@ impl InventoryManager {
         }
     }
 
-    fn now_secs() -> f64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_secs_f64())
-            .unwrap_or(0.0)
-    }
-
     fn f64_to_decimal(v: f64) -> Decimal {
         Decimal::from_f64_retain(v).unwrap_or(Decimal::ZERO)
     }
 
     /// Record a fill in memory (memory-first; no DB in hot path).
-    /// Updates yes/no exposure, realized_pnl, and last_local_fill_timestamp.
     pub fn apply_fill(
         &self,
         market_id: &str,
@@ -103,14 +116,13 @@ impl InventoryManager {
         filled_size: f64,
         fill_price: f64,
     ) {
-        let now = Self::now_secs();
         let size_dec = Self::f64_to_decimal(filled_size);
         let price_dec = Self::f64_to_decimal(fill_price);
-        
+
         let mut entry = self
             .exposures
             .entry(market_id.to_string())
-            .or_insert_with(InternalExposure::default);
+            .or_default();
 
         match side {
             OrderSide::Buy => {
@@ -130,19 +142,18 @@ impl InventoryManager {
                 entry.realized_pnl += price_dec * size_dec;
             }
         }
-        entry.last_local_fill_timestamp = now;
+        entry.last_local_fill_at = Some(Instant::now());
     }
 
-    /// Convenience: record fill by token outcome only (no price/pnl). Prefer `apply_fill` when you have price.
+    /// Convenience: record fill by token outcome only (no price/pnl).
     pub fn add_fill(&self, token_id: &str, is_yes: bool, side: OrderSide, qty: f64) {
         let delta = Self::f64_to_decimal(qty);
-        let now = Self::now_secs();
-        
+
         let mut entry = self
             .exposures
             .entry(token_id.to_string())
-            .or_insert_with(InternalExposure::default);
-            
+            .or_default();
+
         if is_yes {
             match side {
                 OrderSide::Buy => entry.yes_qty += delta,
@@ -154,40 +165,51 @@ impl InventoryManager {
                 OrderSide::Sell => entry.no_qty -= delta,
             }
         }
-        entry.last_local_fill_timestamp = now;
+        entry.last_local_fill_at = Some(Instant::now());
     }
 
-    /// Total exposure across all markets (yes + no + pending buy notionals).
-    /// Used for global budget check (align with PolyMatrix get_global_exposure).
+    /// Total exposure across all markets.
     pub fn get_global_exposure(&self) -> f64 {
-        self.exposures.iter().fold(Decimal::ZERO, |acc, r| {
+        let total = self.exposures.iter().fold(Decimal::ZERO, |acc, r| {
             acc + r.yes_qty + r.no_qty
                 + r.pending_yes_buy_notional
                 + r.pending_no_buy_notional
-        }).to_string().parse().unwrap_or(0.0)
+        });
+        dec_to_f64(total)
     }
 
-    /// Total exposure excluding one market (e.g. when evaluating adding a new market).
+    /// Total exposure excluding one market.
     pub fn get_global_exposure_excluding(&self, market_id: &str) -> f64 {
-        self.exposures
+        let total = self
+            .exposures
             .iter()
             .filter(|r| r.key() != market_id)
             .fold(Decimal::ZERO, |acc, r| {
                 acc + r.yes_qty + r.no_qty
                     + r.pending_yes_buy_notional
                     + r.pending_no_buy_notional
-            }).to_string().parse().unwrap_or(0.0)
+            });
+        dec_to_f64(total)
     }
 
-    /// Update pending BUY notional for a token (for balance precheck before placing orders).
+    /// Total realized P&L across all markets (in USDC).
+    pub fn get_total_realized_pnl(&self) -> f64 {
+        let total = self
+            .exposures
+            .iter()
+            .fold(Decimal::ZERO, |acc, r| acc + r.realized_pnl);
+        dec_to_f64(total)
+    }
+
+    /// Update pending BUY notional for a token.
     pub fn update_pending_buy_notional(&self, market_id: &str, is_yes: bool, notional: f64) {
         let n = Self::f64_to_decimal(notional).max(Decimal::ZERO);
-        
+
         let mut entry = self
             .exposures
             .entry(market_id.to_string())
-            .or_insert_with(InternalExposure::default);
-            
+            .or_default();
+
         if is_yes {
             entry.pending_yes_buy_notional = n;
         } else {
@@ -195,15 +217,16 @@ impl InventoryManager {
         }
     }
 
-    /// Seconds since epoch of last local fill; watchdog uses this to skip overwrite shortly after fill.
-    pub fn get_last_local_fill_timestamp(&self, market_id: &str) -> f64 {
+    /// Seconds elapsed since last local fill (monotonic).
+    /// Returns f64::MAX if no fill has been recorded.
+    pub fn get_last_local_fill_elapsed_secs(&self, market_id: &str) -> f64 {
         self.exposures
             .get(market_id)
-            .map(|e| e.last_local_fill_timestamp)
-            .unwrap_or(0.0)
+            .and_then(|e| e.last_local_fill_at.map(|t| t.elapsed().as_secs_f64()))
+            .unwrap_or(f64::MAX)
     }
 
-    /// Overwrite in-memory yes/no from reconciliation (e.g. REST positions); keep last_local_fill_timestamp.
+    /// Overwrite in-memory yes/no from reconciliation.
     pub fn apply_reconciliation_snapshot(
         &self,
         market_id: &str,
@@ -213,7 +236,7 @@ impl InventoryManager {
         let mut entry = self
             .exposures
             .entry(market_id.to_string())
-            .or_insert_with(InternalExposure::default);
+            .or_default();
         entry.yes_qty = Self::f64_to_decimal(yes_exposure);
         entry.no_qty = Self::f64_to_decimal(no_exposure);
     }
@@ -222,8 +245,16 @@ impl InventoryManager {
     pub fn get_net_exposure(&self, token_id: &str) -> f64 {
         self.exposures
             .get(token_id)
-            .map(|e| (e.yes_qty - e.no_qty).to_string().parse().unwrap_or(0.0))
+            .map(|e| dec_to_f64(e.yes_qty - e.no_qty))
             .unwrap_or(0.0)
+    }
+
+    /// Zero-allocation hot-path read: returns (yes_qty, no_qty) as f64.
+    pub fn get_exposure_qty(&self, token_id: &str) -> (f64, f64) {
+        self.exposures
+            .get(token_id)
+            .map(|e| (dec_to_f64(e.yes_qty), dec_to_f64(e.no_qty)))
+            .unwrap_or((0.0, 0.0))
     }
 
     pub fn get_exposure(&self, token_id: &str) -> MarketExposure {
@@ -233,12 +264,10 @@ impl InventoryManager {
             .unwrap_or_default()
     }
 
-    /// All market ids currently in the ledger (for watchdog iteration).
     pub fn market_ids(&self) -> Vec<String> {
         self.exposures.iter().map(|r| r.key().clone()).collect()
     }
 
-    /// Snapshot all market exposures for API responses.
     pub fn snapshot_all(&self) -> Vec<(String, MarketExposure)> {
         self.exposures
             .iter()
@@ -258,11 +287,8 @@ mod tests {
         let inventory = InventoryManager::new();
         let market = "mkt-test";
 
-        // Buy 10 @ 0.50  => cost 5.0
         inventory.apply_fill(market, true, OrderSide::Buy, 10.0, 0.5);
-        // Buy 5 @ 0.60   => cost 3.0
         inventory.apply_fill(market, true, OrderSide::Buy, 5.0, 0.6);
-        // Sell 8 @ 0.70  => revenue 5.6
         inventory.apply_fill(market, true, OrderSide::Sell, 8.0, 0.7);
 
         let exposure = inventory.get_exposure(market);
@@ -276,21 +302,21 @@ mod tests {
     }
 
     #[test]
-    fn test_last_local_fill_timestamp_updates() {
+    fn test_last_local_fill_elapsed_updates() {
         let inventory = InventoryManager::new();
         let market = "mkt-ts";
 
-        let t0 = inventory.get_last_local_fill_timestamp(market);
-        assert_eq!(t0, 0.0);
+        let e0 = inventory.get_last_local_fill_elapsed_secs(market);
+        assert_eq!(e0, f64::MAX);
 
         inventory.add_fill(market, true, OrderSide::Buy, 1.0);
-        let t1 = inventory.get_last_local_fill_timestamp(market);
-        assert!(t1 > 0.0);
+        let e1 = inventory.get_last_local_fill_elapsed_secs(market);
+        assert!(e1 < 1.0);
 
         thread::sleep(Duration::from_millis(10));
         inventory.add_fill(market, true, OrderSide::Buy, 1.0);
-        let t2 = inventory.get_last_local_fill_timestamp(market);
-        assert!(t2 >= t1);
+        let e2 = inventory.get_last_local_fill_elapsed_secs(market);
+        assert!(e2 < e1 + 1.0);
     }
 
     #[test]

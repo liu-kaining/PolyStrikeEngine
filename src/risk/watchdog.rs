@@ -5,6 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::sleep;
+use tracing::error;
 
 use super::{InventoryManager, RiskGuard};
 
@@ -55,7 +56,7 @@ impl Watchdog {
             if self.max_exposure_per_market > 0.0
                 && (yes_exp > self.max_exposure_per_market || no_exp > self.max_exposure_per_market)
             {
-                eprintln!(
+                error!(
                     "[Watchdog] RISK BREACH (Memory): Market {} exceeded limit ({})! YES: {:.2}, NO: {:.2}",
                     &market_id[..market_id.len().min(12)],
                     self.max_exposure_per_market,
@@ -69,7 +70,7 @@ impl Watchdog {
         let global_exposure = inventory.get_global_exposure();
         let limit = self.global_max_budget * self.global_leeway;
         if global_exposure > limit {
-            eprintln!(
+            error!(
                 "[Watchdog] GLOBAL RISK BREACH: Total exposure ${:.2} exceeds budget ${:.2} (with leeway)!",
                 global_exposure, limit
             );

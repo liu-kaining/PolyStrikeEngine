@@ -65,4 +65,9 @@ impl StrategyRegistry {
     pub fn get_token(&self, token_id: &str) -> Option<CancellationToken> {
         self.cancel_tokens.get(token_id).map(|t| t.clone())
     }
+
+    /// Number of active strategies being monitored.
+    pub fn len(&self) -> usize {
+        self.cancel_tokens.len()
+    }
 }

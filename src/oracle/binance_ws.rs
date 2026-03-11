@@ -1,4 +1,6 @@
 //! Binance WebSocket book ticker stream with robust reconnection logic.
+//! On max retries exceeded, drops the watch::Sender to signal downstream consumers
+//! instead of panicking the process.
 
 use std::time::Duration;
 
@@ -6,11 +8,10 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+use tracing::{error, info};
 
 use crate::models::types::BookTicker;
 
-/// Raw Binance `@bookTicker` payload for a single symbol.
-/// Note: combined stream (e.g. btcusdt@bookTicker) may omit "E" (event_time).
 #[derive(Debug, Deserialize)]
 struct BinanceBookTicker {
     #[serde(rename = "u")]
@@ -47,18 +48,14 @@ impl TryFrom<BinanceBookTicker> for BookTicker {
     }
 }
 
-/// Maximum number of consecutive connection failures before giving up.
 const MAX_RETRIES: u32 = 10;
-/// Maximum backoff duration in milliseconds.
-const MAX_BACKOFF_MS: u64 = 30_000; // 30 seconds
+const MAX_BACKOFF_MS: u64 = 30_000;
 
 /// Spawns a dedicated task that maintains a low-latency Binance `@bookTicker` stream.
 ///
 /// Returns a `watch::Receiver<BookTicker>` that always holds the latest tick.
-/// Subscribers get notified only when a new, valid tick is received.
-///
-/// # Panics
-/// Panics after `MAX_RETRIES` consecutive connection failures to alert the main engine.
+/// If MAX_RETRIES consecutive connection failures occur, the task exits gracefully
+/// (dropping the Sender, which causes all Receivers to get `Err` on `changed()`).
 pub async fn spawn_binance_book_ticker_stream(
     symbol: &str,
 ) -> anyhow::Result<watch::Receiver<BookTicker>> {
@@ -77,21 +74,19 @@ pub async fn spawn_binance_book_ticker_stream(
         loop {
             match connect_async(&url).await {
                 Ok((ws_stream, _)) => {
-                    eprintln!("[Binance WS] Connected: {}", url);
                     let (_write, mut read) = ws_stream.split();
-                    
-                    // Reset backoff and failure counter on successful connection
+
                     backoff_ms = 500;
                     consecutive_failures = 0;
+                    info!("[Binance WS] Reconnected successfully");
 
-                    let mut first_msg = true;
                     let mut parse_fail_logged = 0u32;
-                    
+
                     while let Some(msg_result) = read.next().await {
                         let msg = match msg_result {
                             Ok(m) => m,
                             Err(e) => {
-                                eprintln!("[Binance WS] Stream error: {:?}", e);
+                                error!("[Binance WS] Stream error: {:?}", e);
                                 break;
                             }
                         };
@@ -100,17 +95,14 @@ pub async fn spawn_binance_book_ticker_stream(
                             continue;
                         };
 
-                        if first_msg {
-                            first_msg = false;
-                            let preview = text.chars().take(120).collect::<String>();
-                            eprintln!("[Binance WS] First raw message: {}...", preview);
-                        }
-
                         let parsed: BinanceBookTicker = match serde_json::from_str(&text) {
                             Ok(v) => v,
                             Err(_) => {
                                 if parse_fail_logged < 3 && text.len() < 300 {
-                                    eprintln!("[Binance WS] Parse skip (not bookTicker?): {}...", &text[..text.len().min(150)]);
+                                    error!(
+                                        "[Binance WS] Parse skip (not bookTicker?): {}...",
+                                        &text[..text.len().min(150)]
+                                    );
                                     parse_fail_logged += 1;
                                 }
                                 continue;
@@ -124,24 +116,24 @@ pub async fn spawn_binance_book_ticker_stream(
 
                         let _ = tx.send(ticker);
                     }
-                    
-                    // Stream ended, will retry below
-                    eprintln!("[Binance WS] Stream ended, reconnecting...");
+
+                    error!("[Binance WS] Stream ended, reconnecting...");
                 }
                 Err(e) => {
                     consecutive_failures += 1;
-                    eprintln!(
+                    error!(
                         "[Binance WS] Connection failed ({}/{}): {:?}, retrying in {}ms",
                         consecutive_failures, MAX_RETRIES, e, backoff_ms
                     );
-                    
-                    // CRITICAL: Panic after max retries to alert main engine
+
                     if consecutive_failures >= MAX_RETRIES {
-                        panic!(
+                        error!(
                             "[Binance WS] CRITICAL: Max retries ({}) exceeded. \
-                             Check network connectivity or Binance API status!",
+                             Dropping sender to signal downstream tasks.",
                             MAX_RETRIES
                         );
+                        // Drop tx by returning — all receivers will see Err on changed()
+                        return;
                     }
                 }
             }

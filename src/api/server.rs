@@ -7,17 +7,29 @@ use axum::{
     Json, Router,
 };
 use serde::Serialize;
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
 
-use crate::api::{models::StartStrategyReq, strategy_registry::StrategyRegistry};
+use crate::api::{
+    models::{StartEventRadarReq, StartStrategyReq},
+    strategy_registry::StrategyRegistry,
+};
+use crate::discovery::radar;
 use crate::engine;
+use crate::execution::poly_client::PolyClient;
+use crate::models::types::BookTicker;
 use crate::risk::{InventoryManager, MarketExposure, RiskGuard};
+use tracing::{error, info};
 
-/// Global app state: inventory + active strategy registry (token_id -> CancellationToken).
 #[derive(Clone)]
 struct ApiState {
     inventory: Arc<InventoryManager>,
     strategies: Arc<StrategyRegistry>,
     risk_guard: Arc<RiskGuard>,
+    poly_client: Option<Arc<PolyClient>>,
+    binance_rx: watch::Receiver<BookTicker>,
+    dry_run: bool,
+    global_cancel: CancellationToken,
 }
 
 #[derive(Serialize)]
@@ -62,20 +74,34 @@ async fn strategy_start_handler(
     let token_id = req.token_id.clone();
     let strike_price = req.strike_price;
     let snipe_size = req.snipe_size;
+    let expiry_timestamp = req.expiry_timestamp;
+    let volatility = req.volatility;
+    let dry_run = state.dry_run;
     let inventory = state.inventory.clone();
     let risk_guard = state.risk_guard.clone();
     let strategies = state.strategies.clone();
+    let poly_client = state.poly_client.clone();
+    let binance_rx = state.binance_rx.clone();
+    let child_cancel = state.global_cancel.child_token();
+
+    // Combine per-strategy cancel with global shutdown
+    let combined_cancel = CancellationToken::new();
+    let cc = combined_cancel.clone();
+    let ct = cancel_token.clone();
+    let gc = child_cancel.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = ct.cancelled() => { cc.cancel(); }
+            _ = gc.cancelled() => { cc.cancel(); }
+        }
+    });
+
     tokio::spawn(async move {
         engine::run_sniper_task(
-            token_id,
-            strike_price,
-            snipe_size,
-            inventory,
-            risk_guard,
-            cancel_token,
-            strategies,
-        )
-        .await;
+            token_id, strike_price, snipe_size, expiry_timestamp, volatility,
+            dry_run, inventory, risk_guard, poly_client, binance_rx,
+            combined_cancel, strategies,
+        ).await;
     });
     Ok(Json(MessageResponse {
         message: format!("Strategy started for token {}", req.token_id),
@@ -99,35 +125,110 @@ async fn strategy_stop_handler(
     }))
 }
 
+async fn event_start_handler(
+    State(state): State<ApiState>,
+    Json(req): Json<StartEventRadarReq>,
+) -> Result<Json<MessageResponse>, (StatusCode, Json<MessageResponse>)> {
+    let markets = radar::fetch_event_markets(&req.event_slug)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(MessageResponse {
+                    message: format!("Failed to discover markets for slug {}: {}", req.event_slug, e),
+                }),
+            )
+        })?;
+
+    let mut started = 0usize;
+    let mut skipped = 0usize;
+
+    for market in markets {
+        let Some(cancel_token) = state.strategies.try_register(market.token_id.clone()) else {
+            skipped += 1;
+            continue;
+        };
+
+        let token_id = market.token_id;
+        let strike_price = market.strike_price;
+        let expiry_timestamp = market.expiry_timestamp;
+        let snipe_size = req.snipe_size;
+        let volatility = req.volatility;
+        let dry_run = state.dry_run;
+        let inventory = state.inventory.clone();
+        let risk_guard = state.risk_guard.clone();
+        let strategies = state.strategies.clone();
+        let poly_client = state.poly_client.clone();
+        let binance_rx = state.binance_rx.clone();
+        let child_cancel = state.global_cancel.child_token();
+
+        let combined_cancel = CancellationToken::new();
+        let cc = combined_cancel.clone();
+        let ct = cancel_token.clone();
+        let gc = child_cancel.clone();
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = ct.cancelled() => { cc.cancel(); }
+                _ = gc.cancelled() => { cc.cancel(); }
+            }
+        });
+
+        tokio::spawn(async move {
+            engine::run_sniper_task(
+                token_id, strike_price, snipe_size, expiry_timestamp, volatility,
+                dry_run, inventory, risk_guard, poly_client, binance_rx,
+                combined_cancel, strategies,
+            ).await;
+        });
+        started += 1;
+    }
+
+    Ok(Json(MessageResponse {
+        message: format!(
+            "Event radar started for slug {}: {} markets launched ({} skipped).",
+            req.event_slug, started, skipped
+        ),
+    }))
+}
+
 pub async fn start_api_server(
     inventory: Arc<InventoryManager>,
     risk_guard: Arc<RiskGuard>,
     strategies: Arc<StrategyRegistry>,
+    poly_client: Option<Arc<PolyClient>>,
+    binance_rx: watch::Receiver<BookTicker>,
+    dry_run: bool,
+    global_cancel: CancellationToken,
     port: u16,
 ) {
     let app_state = ApiState {
         inventory,
         strategies,
         risk_guard,
+        poly_client,
+        binance_rx,
+        dry_run,
+        global_cancel,
     };
     let app = Router::new()
         .route("/status", get(status_handler))
         .route("/exposure", get(exposure_handler))
         .route("/strategy/start", post(strategy_start_handler))
         .route("/strategy/stop", post(strategy_stop_handler))
+        .route("/event/start", post(event_start_handler))
         .with_state(app_state);
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
-    println!("[API] SaaS gateway listening on http://{}", addr);
+    info!("[API] SaaS gateway listening on http://{}", addr);
 
     let listener = match tokio::net::TcpListener::bind(addr).await {
         Ok(l) => l,
         Err(e) => {
-            eprintln!("[API] Failed to bind {}: {}", addr, e);
+            error!("[API] Failed to bind {}: {}", addr, e);
             return;
         }
     };
     if let Err(e) = axum::serve(listener, app).await {
-        eprintln!("[API] Server error: {}", e);
+        error!("[API] Server error: {}", e);
     }
 }

@@ -1,10 +1,16 @@
 //! Polymarket WebSocket orderbook stream with robust reconnection logic.
+//! On max retries exceeded, drops the watch::Sender to signal downstream consumers
+//! instead of panicking the process.
 
 use std::time::Duration;
 
 use futures_util::StreamExt;
-use polymarket_client_sdk::clob::ws::{Client as WsClient, types::response::BookUpdate};
+use polymarket_client_sdk::clob::ws::{
+    types::response::BookUpdate,
+    Client as WsClient,
+};
 use tokio::sync::watch;
+use tracing::error;
 
 /// Best bid/ask snapshot for a single token (from Polymarket CLOB).
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -13,9 +19,7 @@ pub struct PolyBookTicker {
     pub best_ask: f64,
 }
 
-/// Maximum number of consecutive connection failures before giving up.
 const MAX_RETRIES: u32 = 10;
-/// Backoff duration between retries.
 const INITIAL_BACKOFF_MS: u64 = 1000;
 const MAX_BACKOFF_MS: u64 = 30_000;
 
@@ -40,8 +44,8 @@ fn book_update_to_ticker(book: &BookUpdate) -> PolyBookTicker {
 /// Spawns a task that subscribes to Polymarket orderbook for `token_id` and sends
 /// the latest best bid/ask via a watch channel.
 ///
-/// # Panics
-/// Panics after `MAX_RETRIES` consecutive connection failures to alert the main engine.
+/// If MAX_RETRIES consecutive connection failures occur, the task exits gracefully
+/// (dropping the Sender, which causes all Receivers to get `Err` on `changed()`).
 pub fn spawn_poly_orderbook_stream(
     token_id: &str,
 ) -> anyhow::Result<watch::Receiver<PolyBookTicker>> {
@@ -54,17 +58,14 @@ pub fn spawn_poly_orderbook_stream(
 
         loop {
             let client = WsClient::default();
-            
+
             match client.subscribe_orderbook(vec![token_id.clone()]) {
                 Ok(stream) => {
-                    eprintln!("[Poly WS] Connected to orderbook for token {}...", &token_id[..token_id.len().min(12)]);
-                    
-                    // Reset backoff and failure counter on successful connection
                     backoff_ms = INITIAL_BACKOFF_MS;
                     consecutive_failures = 0;
-                    
+
                     let mut stream = Box::pin(stream);
-                    
+
                     while let Some(result) = stream.next().await {
                         match result {
                             Ok(book) => {
@@ -72,29 +73,29 @@ pub fn spawn_poly_orderbook_stream(
                                 let _ = tx.send(ticker);
                             }
                             Err(e) => {
-                                eprintln!("[Poly WS] Stream error: {:?}, reconnecting...", e);
+                                error!("[Poly WS] Stream error: {:?}, reconnecting...", e);
                                 break;
                             }
                         }
                     }
-                    
-                    // Stream ended, will retry below
-                    eprintln!("[Poly WS] Stream ended, reconnecting...");
+
+                    error!("[Poly WS] Stream ended, reconnecting...");
                 }
                 Err(e) => {
                     consecutive_failures += 1;
-                    eprintln!(
+                    error!(
                         "[Poly WS] Connection failed ({}/{}): {:?}, retrying in {}ms",
                         consecutive_failures, MAX_RETRIES, e, backoff_ms
                     );
-                    
-                    // CRITICAL: Panic after max retries to alert main engine
+
                     if consecutive_failures >= MAX_RETRIES {
-                        panic!(
+                        error!(
                             "[Poly WS] CRITICAL: Max retries ({}) exceeded for token {}. \
-                             Check Polymarket API status or token validity!",
-                            MAX_RETRIES, &token_id[..token_id.len().min(20)]
+                             Dropping sender to signal downstream task.",
+                            MAX_RETRIES,
+                            &token_id[..token_id.len().min(20)]
                         );
+                        return;
                     }
                 }
             }
