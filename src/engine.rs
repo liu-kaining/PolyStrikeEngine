@@ -19,6 +19,7 @@ const EXIT_THRESHOLD: f64 = 0.01;
 const MIN_PROFIT: f64 = 0.015;
 const ORDER_TIMEOUT_SECS: u64 = 5;
 const PENDING_WATCHDOG_SECS: u64 = 8;
+const ORDER_FAIL_COOLDOWN_SECS: u64 = 10;
 
 #[derive(Debug, Clone)]
 struct ExecutedOrderUpdate {
@@ -108,6 +109,7 @@ pub async fn run_sniper_task(
     };
 
     let (fill_tx, mut fill_rx) = mpsc::channel::<ExecutedOrderUpdate>(1024);
+    let mut last_order_fail: Option<Instant> = None;
 
     info!("[Engine] 🎯 Monitoring K={:.0}", strike_price);
 
@@ -124,6 +126,7 @@ pub async fn run_sniper_task(
                         }
                         let total_pnl = inventory.get_total_realized_pnl();
                         risk_guard.update_circuit_breaker(total_pnl);
+                        last_order_fail = None;
                         info!(
                             "[HFT-ENTER] ⚡ K={:.0} | Bought at {:.3} | Edge:{:.4} | Size:{:.2}",
                             strike_price, update.price, update.edge_hint, update.size,
@@ -136,16 +139,18 @@ pub async fn run_sniper_task(
                     (PositionState::PendingBuy { .. }, OrderSide::Buy, false) => {
                         if update.reservation.is_some() || update.size > 0.0 {
                             info!(
-                                "[HFT-ENTER] ❌ K={:.0} | Buy failed at {:.3} | Edge:{:.4}",
-                                strike_price, update.price, update.edge_hint,
+                                "[HFT-ENTER] ❌ K={:.0} | Buy failed at {:.3} | Edge:{:.4} | Cooldown {}s",
+                                strike_price, update.price, update.edge_hint, ORDER_FAIL_COOLDOWN_SECS,
                             );
                         }
+                        last_order_fail = Some(Instant::now());
                         PositionState::Empty
                     }
                     (PositionState::PendingSell { buy_price, .. }, OrderSide::Sell, true) => {
                         let profit = update.price - buy_price;
                         let total_pnl = inventory.get_total_realized_pnl();
                         risk_guard.update_circuit_breaker(total_pnl);
+                        last_order_fail = None;
                         info!(
                             "[HFT-EXIT] 💰 K={:.0} | Sold at {:.3} | Buy:{:.3} | Profit:{:.4}",
                             strike_price, update.price, buy_price, profit,
@@ -158,9 +163,10 @@ pub async fn run_sniper_task(
                     }
                     (PositionState::PendingSell { buy_price, amount, amount_trying_to_sell, .. }, OrderSide::Sell, false) => {
                         info!(
-                            "[HFT-EXIT] ❌ K={:.0} | Sell failed at {:.3} | Buy:{:.3} | Size:{:.2}",
-                            strike_price, update.price, buy_price, amount_trying_to_sell,
+                            "[HFT-EXIT] ❌ K={:.0} | Sell failed at {:.3} | Buy:{:.3} | Size:{:.2} | Cooldown {}s",
+                            strike_price, update.price, buy_price, amount_trying_to_sell, ORDER_FAIL_COOLDOWN_SECS,
                         );
+                        last_order_fail = Some(Instant::now());
                         PositionState::Holding { buy_price, amount }
                     }
                     (s, _, _) => s,
@@ -231,6 +237,7 @@ pub async fn run_sniper_task(
                     poly_book.best_ask, poly_book.best_bid,
                     current_position, strike_price, dry_run,
                     &token_id, &risk_guard, &inventory, &poly_client, &fill_tx,
+                    &last_order_fail,
                 ).await;
             }
 
@@ -249,6 +256,7 @@ pub async fn run_sniper_task(
                     poly_book.best_ask, poly_book.best_bid,
                     current_position, strike_price, dry_run,
                     &token_id, &risk_guard, &inventory, &poly_client, &fill_tx,
+                    &last_order_fail,
                 ).await;
             }
         }
@@ -270,7 +278,14 @@ async fn evaluate_and_act(
     inventory: &Arc<InventoryManager>,
     poly_client: &Option<Arc<PolyClient>>,
     fill_tx: &mpsc::Sender<ExecutedOrderUpdate>,
+    last_order_fail: &Option<Instant>,
 ) {
+    if let Some(t) = last_order_fail {
+        if t.elapsed() < Duration::from_secs(ORDER_FAIL_COOLDOWN_SECS) {
+            return;
+        }
+    }
+
     let (_fair_value, buy_edge, sell_edge) =
         compute_edges(sniper_strategy, binance_mid, best_ask, best_bid);
 
@@ -500,7 +515,7 @@ async fn try_fire(
             }).await;
         }
         Ok(Err(e)) => {
-            error!("[FIRE][K={:.0}] Order failed: {}, releasing budget", strike_price, e);
+            error!("[FIRE][K={:.0}] Order failed: {:#?}, releasing budget", strike_price, e);
             if let Some(ref res) = reservation {
                 risk_guard.release_budget(res.as_ref().clone_for_release());
             }
