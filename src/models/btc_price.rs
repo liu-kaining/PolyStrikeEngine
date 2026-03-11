@@ -9,6 +9,7 @@ pub fn set_btc_mid(price: f64) {
 }
 
 /// Read the latest BTC mid seen by any task.
+#[allow(dead_code)]
 pub fn get_btc_mid() -> f64 {
     f64::from_bits(GLOBAL_BTC_MID_BITS.load(Ordering::Relaxed))
 }

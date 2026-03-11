@@ -123,11 +123,17 @@ fn main() -> anyhow::Result<()> {
         ));
 
         // -- 30s heartbeat --
+        let heartbeat_binance_rx = binance_rx.clone();
         tokio::spawn(async move {
+            let rx = heartbeat_binance_rx;
             loop {
                 tokio::time::sleep(Duration::from_secs(30)).await;
+                let ticker = *rx.borrow();
+                let btc_mid = (ticker.bid_price + ticker.ask_price) * 0.5;
+                if btc_mid > 0.0 {
+                    btc_price::set_btc_mid(btc_mid);
+                }
                 let markets = strategies_for_status.len();
-                let btc_mid = btc_price::get_btc_mid();
                 info!(
                     "[System] Radar active. Monitoring {} markets. Last BTC: {:.1}",
                     markets, btc_mid

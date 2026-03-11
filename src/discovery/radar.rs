@@ -88,9 +88,12 @@ pub async fn fetch_event_markets(slug: &str) -> Result<Vec<MarketInfo>, Box<dyn 
                     .and_then(|v| v.as_str())
                     .and_then(parse_number_from_text)
             });
-            let Some(strike_price) = strike_price else {
+            let Some(mut strike_price) = strike_price else {
                 continue;
             };
+            if strike_price < 1000.0 && strike_price > 10.0 {
+                strike_price *= 1000.0;
+            }
 
             let Some(end_date) = market.get("endDate").and_then(|v| v.as_str()) else {
                 continue;

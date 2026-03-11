@@ -187,8 +187,15 @@ pub async fn run_sniper_task(
             }
 
             _ = tokio::time::sleep(wait_duration) => {
+                let ticker = *binance_rx.borrow();
+                let binance_mid = (ticker.bid_price + ticker.ask_price) * 0.5;
+                if binance_mid > 0.0 {
+                    btc_price::set_btc_mid(binance_mid);
+                }
+
                 if first_tick {
-                    info!("[Engine] {} Still waiting for first tick...", token_id);
+                    first_tick = false;
+                    info!("[Engine] K={:.0} waiting for Poly WS first tick...", strike_price);
                 }
                 match &state {
                     PositionState::PendingBuy { entered_at } => {
