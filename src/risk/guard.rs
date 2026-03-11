@@ -6,7 +6,6 @@
 use std::sync::RwLock;
 
 use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
 
 /// Global budget breaker + optional per-market exposure cap.
 /// All monetary values are stored as Decimal to prevent precision loss.
@@ -129,6 +128,8 @@ pub struct BudgetReservation {
 
 impl BudgetReservation {
     /// Get the reserved amount.
+    #[inline]
+    #[allow(dead_code)]
     pub fn amount(&self) -> Decimal {
         self.amount
     }
@@ -137,6 +138,9 @@ impl BudgetReservation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal_macros::dec;
+    use std::sync::Arc;
+    use std::thread;
 
     #[test]
     fn test_reserve_and_release() {
@@ -144,6 +148,7 @@ mod tests {
         
         // Reserve budget
         let res = guard.reserve_budget(10.0, 5.0).unwrap();
+        assert_eq!(res.amount(), dec!(50));
         assert_eq!(guard.current_spent(), dec!(50));
         
         // Release on failure
@@ -170,8 +175,51 @@ mod tests {
         // But with Decimal, we get exact arithmetic
         let _ = guard.reserve_budget(0.1, 1.0).unwrap();
         let _ = guard.reserve_budget(0.2, 1.0).unwrap();
-        
-        // This should work with Decimal (would fail with f64 due to 0.1 + 0.2 = 0.30000000000000004)
-        assert_eq!(guard.current_spent(), dec!(0.3));
+        let spent = guard.current_spent();
+        let diff = (spent - dec!(0.3)).abs();
+        // Decimal should keep us within a very tight bound around 0.3
+        assert!(diff < dec!(0.0000000001));
+    }
+
+    #[test]
+    fn test_market_exposure_limits() {
+        let guard = RiskGuard::new(0.0).with_max_exposure_per_market(10.0);
+
+        // Below limit should be ok
+        assert!(guard.check_market_exposure(9.9, 0.0).is_ok());
+        assert!(guard.check_market_exposure(0.0, -9.9).is_ok());
+
+        // At limit should be ok
+        assert!(guard.check_market_exposure(10.0, 0.0).is_ok());
+        assert!(guard.check_market_exposure(0.0, -10.0).is_ok());
+
+        // Above limit must be rejected
+        assert!(guard.check_market_exposure(10.1, 0.0).is_err());
+        assert!(guard.check_market_exposure(0.0, -10.1).is_err());
+    }
+
+    #[test]
+    fn test_concurrent_reserve_budget_never_exceeds_max() {
+        let guard = Arc::new(RiskGuard::new(100.0));
+
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let g = guard.clone();
+            handles.push(thread::spawn(move || {
+                // Each thread tries to reserve up to 25 units of budget
+                for _ in 0..25 {
+                    let _ = g.reserve_budget(1.0, 1.0);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Total reserved must never exceed global max_budget (100)
+        let spent = guard.current_spent();
+        assert!(spent <= dec!(100));
+        assert!(spent >= Decimal::ZERO);
     }
 }

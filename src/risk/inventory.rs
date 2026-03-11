@@ -246,3 +246,78 @@ impl InventoryManager {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::types::OrderSide;
+    use std::{sync::Arc, thread, time::Duration};
+
+    #[test]
+    fn test_apply_fill_accumulates_and_pnl() {
+        let inventory = InventoryManager::new();
+        let market = "mkt-test";
+
+        // Buy 10 @ 0.50  => cost 5.0
+        inventory.apply_fill(market, true, OrderSide::Buy, 10.0, 0.5);
+        // Buy 5 @ 0.60   => cost 3.0
+        inventory.apply_fill(market, true, OrderSide::Buy, 5.0, 0.6);
+        // Sell 8 @ 0.70  => revenue 5.6
+        inventory.apply_fill(market, true, OrderSide::Sell, 8.0, 0.7);
+
+        let exposure = inventory.get_exposure(market);
+
+        let expected_yes = 10.0 + 5.0 - 8.0;
+        let expected_pnl = -5.0 - 3.0 + 5.6;
+
+        assert!((exposure.yes_qty - expected_yes).abs() < 1e-9);
+        assert!((exposure.no_qty - 0.0).abs() < 1e-9);
+        assert!((exposure.realized_pnl - expected_pnl).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_last_local_fill_timestamp_updates() {
+        let inventory = InventoryManager::new();
+        let market = "mkt-ts";
+
+        let t0 = inventory.get_last_local_fill_timestamp(market);
+        assert_eq!(t0, 0.0);
+
+        inventory.add_fill(market, true, OrderSide::Buy, 1.0);
+        let t1 = inventory.get_last_local_fill_timestamp(market);
+        assert!(t1 > 0.0);
+
+        thread::sleep(Duration::from_millis(10));
+        inventory.add_fill(market, true, OrderSide::Buy, 1.0);
+        let t2 = inventory.get_last_local_fill_timestamp(market);
+        assert!(t2 >= t1);
+    }
+
+    #[test]
+    fn test_concurrent_add_fill_is_consistent() {
+        let inventory = Arc::new(InventoryManager::new());
+        let market = "mkt-concurrent";
+        let threads = 4;
+        let per_thread = 100;
+
+        let mut handles = Vec::new();
+        for _ in 0..threads {
+            let inv = inventory.clone();
+            let m = market.to_string();
+            handles.push(thread::spawn(move || {
+                for _ in 0..per_thread {
+                    inv.add_fill(&m, true, OrderSide::Buy, 1.0);
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let exposure = inventory.get_exposure(market);
+        let expected_yes = (threads * per_thread) as f64;
+        assert!((exposure.yes_qty - expected_yes).abs() < 1e-6);
+        assert!((exposure.no_qty - 0.0).abs() < 1e-6);
+    }
+}

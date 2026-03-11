@@ -4,13 +4,54 @@ use std::time::Duration;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
+use crate::api::strategy_registry::StrategyRegistry;
 use crate::config::AppConfig;
 use crate::execution::poly_client::PolyClient;
 use crate::models::types::BookTicker;
 use crate::oracle::binance_ws::spawn_binance_book_ticker_stream;
 use crate::oracle::poly_ws;
-use crate::risk::{InventoryManager, RiskGuard};
+use crate::risk::{BudgetReservation, InventoryManager, RiskGuard};
 use crate::strategy::SniperStrategy;
+
+/// RAII guard that ensures a strategy is removed from the registry when the task exits
+/// for any reason (cancel, WS error, panic unwind, etc.).
+struct StrategyGuardDrop {
+    strategies: Arc<StrategyRegistry>,
+    token_id: String,
+}
+
+impl Drop for StrategyGuardDrop {
+    fn drop(&mut self) {
+        self.strategies.deregister(&self.token_id);
+    }
+}
+
+/// Ensures reserved budget is released unless explicitly committed.
+struct BudgetRollbackGuard<'a> {
+    risk_guard: &'a RiskGuard,
+    reservation: Option<BudgetReservation>,
+}
+
+impl<'a> BudgetRollbackGuard<'a> {
+    fn new(risk_guard: &'a RiskGuard, reservation: BudgetReservation) -> Self {
+        Self {
+            risk_guard,
+            reservation: Some(reservation),
+        }
+    }
+
+    fn commit(mut self) {
+        self.reservation.take();
+    }
+}
+
+impl Drop for BudgetRollbackGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(reservation) = self.reservation.take() {
+            self.risk_guard.release_budget(reservation);
+        }
+    }
+}
 
 /// Runs a single sniper loop for one market. Exits when `cancel_token` is cancelled.
 pub async fn run_sniper_task(
@@ -18,13 +59,18 @@ pub async fn run_sniper_task(
     strike_price: f64,
     snipe_size: f64,
     inventory: Arc<InventoryManager>,
+    risk_guard: Arc<RiskGuard>,
     cancel_token: CancellationToken,
+    strategies: Arc<StrategyRegistry>,
 ) {
+    let _guard = StrategyGuardDrop {
+        strategies: strategies.clone(),
+        token_id: token_id.clone(),
+    };
+
     let config = AppConfig::from_env();
     let symbol = config.binance_symbol.clone();
-
-    let risk_guard = RiskGuard::new(config.max_budget)
-        .with_max_exposure_per_market(config.max_exposure_per_market);
+    let dry_run = config.dry_run;
 
     let poly_client = match PolyClient::new_from_env().await {
         Ok(c) => Some(c),
@@ -92,8 +138,20 @@ pub async fn run_sniper_task(
                     last_price = binance_mid;
                 }
                 let poly_book = *poly_rx.borrow();
+                println!(
+                    "[Engine Heartbeat] Binance Mid: ${:.2} | Poly Ask: {:.3} | Poly Bid: {:.3}",
+                    binance_mid, poly_book.best_ask, poly_book.best_bid
+                );
                 if let Some(signal) = sniper_strategy.evaluate(binance_mid, &poly_book) {
-                    try_fire(&risk_guard, inventory.as_ref(), poly_client.as_ref(), &token_id, &signal).await;
+                    try_fire(
+                        risk_guard.as_ref(),
+                        inventory.as_ref(),
+                        poly_client.as_ref(),
+                        &token_id,
+                        &signal,
+                        dry_run,
+                    )
+                    .await;
                 }
             }
             changed = poly_rx.changed() => {
@@ -103,8 +161,20 @@ pub async fn run_sniper_task(
                 let ticker = *binance_rx.borrow();
                 let binance_mid = (ticker.bid_price + ticker.ask_price) * 0.5;
                 let poly_book = *poly_rx.borrow();
+                println!(
+                    "[Engine Heartbeat] Binance Mid: ${:.2} | Poly Ask: {:.3} | Poly Bid: {:.3}",
+                    binance_mid, poly_book.best_ask, poly_book.best_bid
+                );
                 if let Some(signal) = sniper_strategy.evaluate(binance_mid, &poly_book) {
-                    try_fire(&risk_guard, inventory.as_ref(), poly_client.as_ref(), &token_id, &signal).await;
+                    try_fire(
+                        risk_guard.as_ref(),
+                        inventory.as_ref(),
+                        poly_client.as_ref(),
+                        &token_id,
+                        &signal,
+                        dry_run,
+                    )
+                    .await;
                 }
             }
         }
@@ -117,18 +187,29 @@ async fn try_fire(
     poly_client: Option<&PolyClient>,
     token_id: &str,
     signal: &crate::strategy::SnipeSignal,
+    dry_run: bool,
 ) {
     if token_id.is_empty() {
         return;
     }
-    if let Err(e) = risk_guard.check_and_reserve_budget(signal.target_price, signal.size) {
-        println!("[RiskGuard] Blocked before fire: {}", e);
+    let reservation = match risk_guard.reserve_budget(signal.target_price, signal.size) {
+        Ok(r) => r,
+        Err(e) => {
+            println!("[RiskGuard] Blocked before fire: {}", e);
+            return;
+        }
+    };
+    let rollback_guard = BudgetRollbackGuard::new(risk_guard, reservation);
+
+    if dry_run {
+        println!("[DRY RUN] Would have executed snipe order. Releasing budget...");
         return;
     }
+
     println!("[FIRE] Triggering snipe order: {:?}", signal);
 
     let Some(client) = poly_client else {
-        eprintln!("[FIRE] PolyClient not available, skip.");
+        eprintln!("[FIRE] PolyClient not available, releasing budget.");
         return;
     };
 
@@ -139,9 +220,10 @@ async fn try_fire(
         Ok(order_id) => {
             println!("[FIRE] Order placed: {}", order_id);
             inventory.add_fill(token_id, true, signal.side, signal.size);
+            rollback_guard.commit();
         }
         Err(e) => {
-            eprintln!("[FIRE] Order failed: {}", e);
+            eprintln!("[FIRE] Order failed: {}, releasing budget", e);
         }
     }
 }
