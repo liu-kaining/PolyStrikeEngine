@@ -1,4 +1,5 @@
 use std::time::Duration;
+use std::sync::Arc;
 
 use tokio::sync::watch;
 
@@ -10,11 +11,10 @@ use crate::oracle::poly_ws::{self, PolyBookTicker};
 use crate::risk::{InventoryManager, RiskGuard};
 use crate::strategy::SniperStrategy;
 
-pub async fn run() -> anyhow::Result<()> {
+pub async fn run(inventory: Arc<InventoryManager>) -> anyhow::Result<()> {
     let config = AppConfig::from_env();
     let symbol = config.binance_symbol.clone();
 
-    let inventory = InventoryManager::new();
     let risk_guard = RiskGuard::new(config.max_budget)
         .with_max_exposure_per_market(config.max_exposure_per_market);
 
@@ -81,7 +81,7 @@ pub async fn run() -> anyhow::Result<()> {
                     }
                     let poly_book = *poly_rx.borrow();
                     if let Some(signal) = sniper_strategy.evaluate(binance_mid, &poly_book) {
-                        try_fire(&risk_guard, &inventory, poly_client.as_ref(), &poly_token_id, &signal).await;
+                        try_fire(&risk_guard, inventory.as_ref(), poly_client.as_ref(), &poly_token_id, &signal).await;
                     }
                 }
                 changed = poly_rx.changed() => {
@@ -92,7 +92,7 @@ pub async fn run() -> anyhow::Result<()> {
                     let binance_mid = (ticker.bid_price + ticker.ask_price) * 0.5;
                     let poly_book = *poly_rx.borrow();
                     if let Some(signal) = sniper_strategy.evaluate(binance_mid, &poly_book) {
-                        try_fire(&risk_guard, &inventory, poly_client.as_ref(), &poly_token_id, &signal).await;
+                        try_fire(&risk_guard, inventory.as_ref(), poly_client.as_ref(), &poly_token_id, &signal).await;
                     }
                 }
             }
@@ -126,7 +126,7 @@ pub async fn run() -> anyhow::Result<()> {
                     }
                     let poly_book = PolyBookTicker::default();
                     if let Some(signal) = sniper_strategy.evaluate(binance_mid, &poly_book) {
-                        try_fire(&risk_guard, &inventory, poly_client.as_ref(), &poly_token_id, &signal).await;
+                        try_fire(&risk_guard, inventory.as_ref(), poly_client.as_ref(), &poly_token_id, &signal).await;
                     }
                 }
             }

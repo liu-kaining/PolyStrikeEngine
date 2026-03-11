@@ -13,10 +13,8 @@ pub struct SnipeSignal {
 
 /// Placeholder strategy: when Binance price exceeds target, look for cheap YES on Polymarket.
 pub struct SniperStrategy {
-    /// BTC price above which we consider YES to be near 1.0 (e.g. 100_000.0).
-    pub target_btc_price: f64,
-    /// Max ask price we're willing to pay for YES when condition holds (e.g. 0.90).
-    pub max_ask_for_yes_snipe: f64,
+    /// Strike price for the event market (e.g. BTC >= 72_000 at expiry).
+    pub strike_price: f64,
     /// Size to fire (e.g. 100.0).
     pub snipe_size: f64,
 }
@@ -24,20 +22,30 @@ pub struct SniperStrategy {
 impl Default for SniperStrategy {
     fn default() -> Self {
         Self {
-            target_btc_price: 100_000.0,
-            max_ask_for_yes_snipe: 0.90,
+            strike_price: 72_000.0,
             snipe_size: 100.0,
         }
     }
 }
 
 impl SniperStrategy {
-    /// Evaluate: if binance_price > target_btc_price and poly best_ask < threshold, return Buy YES signal.
+    /// Simplified probability oracle:
+    /// map distance to strike into [0, 1] using a sigmoid.
+    fn calculate_fair_value(binance_price: f64, strike_price: f64) -> f64 {
+        if strike_price <= 0.0 {
+            return 0.5;
+        }
+        let x = (binance_price - strike_price) / (strike_price * 0.02); // +/-2% scale
+        1.0 / (1.0 + (-x).exp())
+    }
+
+    /// Evaluate current edge. If fair_value - best_ask > 0.05, fire Buy YES.
     pub fn evaluate(&self, binance_price: f64, poly_book: &PolyBookTicker) -> Option<SnipeSignal> {
-        if binance_price <= self.target_btc_price {
+        if poly_book.best_ask <= 0.0 {
             return None;
         }
-        if poly_book.best_ask >= self.max_ask_for_yes_snipe || poly_book.best_ask <= 0.0 {
+        let fair_value = Self::calculate_fair_value(binance_price, self.strike_price);
+        if fair_value - poly_book.best_ask <= 0.05 {
             return None;
         }
         Some(SnipeSignal {

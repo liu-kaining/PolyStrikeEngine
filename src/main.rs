@@ -1,3 +1,4 @@
+mod api;
 mod config;
 mod engine;
 mod execution;
@@ -5,6 +6,9 @@ mod models;
 mod oracle;
 mod risk;
 mod strategy;
+use std::sync::Arc;
+
+use risk::InventoryManager;
 
 fn main() -> anyhow::Result<()> {
     // Required by rustls 0.23+ when used via tokio-tungstenite (wss://).
@@ -16,6 +20,11 @@ fn main() -> anyhow::Result<()> {
     println!("[PolyStrike Engine] Starting...");
 
     let rt = tokio::runtime::Runtime::new().expect("create tokio runtime");
-    rt.block_on(engine::run())
+    rt.block_on(async {
+        let inventory = Arc::new(InventoryManager::new());
+
+        tokio::spawn(api::server::start_api_server(inventory.clone(), 3333));
+        engine::run(inventory).await
+    })
 }
 

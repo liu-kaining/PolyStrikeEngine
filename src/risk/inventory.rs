@@ -4,11 +4,12 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
+use serde::Serialize;
 
 use crate::models::types::OrderSide;
 
 /// Per-market exposure snapshot: positions + pending buy notional + reconciliation metadata.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize)]
 #[allow(dead_code)]
 pub struct MarketExposure {
     pub yes_qty: f64,
@@ -181,5 +182,13 @@ impl InventoryManager {
     /// All market ids currently in the ledger (for watchdog iteration).
     pub fn market_ids(&self) -> Vec<String> {
         self.exposures.iter().map(|r| r.key().clone()).collect()
+    }
+
+    /// Snapshot all market exposures for API responses.
+    pub fn snapshot_all(&self) -> Vec<(String, MarketExposure)> {
+        self.exposures
+            .iter()
+            .map(|r| (r.key().clone(), r.value().clone()))
+            .collect()
     }
 }
