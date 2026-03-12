@@ -71,6 +71,14 @@ fn main() -> anyhow::Result<()> {
             return;
         }
 
+        if let Err(e) = discovery::radar::init_radar_client(cfg.https_proxy.as_deref()) {
+            error!("[System] Radar client init failed: {}", e);
+            return;
+        }
+        if cfg.https_proxy.is_some() {
+            info!("[System] HTTPS proxy configured for radar.");
+        }
+
         let inventory = Arc::new(InventoryManager::new());
         let risk_guard = Arc::new(
             RiskGuard::new(cfg.max_budget)

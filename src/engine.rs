@@ -14,12 +14,13 @@ use crate::oracle::poly_ws;
 use crate::risk::{BudgetReservation, InventoryManager, RiskGuard};
 use crate::strategy::SniperStrategy;
 
-const ENTER_THRESHOLD: f64 = 0.01;
-const EXIT_THRESHOLD: f64 = 0.01;
-const MIN_PROFIT: f64 = 0.015;
+const ENTER_THRESHOLD: f64 = 0.005;
+const EXIT_THRESHOLD: f64 = 0.005;
+const MIN_PROFIT: f64 = 0.008;
 const ORDER_TIMEOUT_SECS: u64 = 5;
 const PENDING_WATCHDOG_SECS: u64 = 8;
-const ORDER_FAIL_COOLDOWN_SECS: u64 = 10;
+const ORDER_FAIL_COOLDOWN_SECS: u64 = 5;
+const EDGE_MONITOR_INTERVAL: u64 = 500;
 
 #[derive(Debug, Clone)]
 struct ExecutedOrderUpdate {
@@ -110,6 +111,7 @@ pub async fn run_sniper_task(
 
     let (fill_tx, mut fill_rx) = mpsc::channel::<ExecutedOrderUpdate>(1024);
     let mut last_order_fail: Option<Instant> = None;
+    let mut tick_count: u64 = 0;
 
     info!("[Engine] 🎯 Monitoring K={:.0}", strike_price);
 
@@ -239,12 +241,13 @@ pub async fn run_sniper_task(
                 }
                 let poly_book = *poly_rx.borrow();
 
+                tick_count += 1;
                 evaluate_and_act(
                     &mut state, &sniper_strategy, binance_mid,
                     poly_book.best_ask, poly_book.best_bid,
                     current_position, strike_price, dry_run,
                     &token_id, &risk_guard, &inventory, &poly_client, &fill_tx,
-                    &last_order_fail,
+                    &last_order_fail, tick_count,
                 ).await;
             }
 
@@ -258,12 +261,13 @@ pub async fn run_sniper_task(
                 btc_price::set_btc_mid(binance_mid);
                 let poly_book = *poly_rx.borrow();
 
+                tick_count += 1;
                 evaluate_and_act(
                     &mut state, &sniper_strategy, binance_mid,
                     poly_book.best_ask, poly_book.best_bid,
                     current_position, strike_price, dry_run,
                     &token_id, &risk_guard, &inventory, &poly_client, &fill_tx,
-                    &last_order_fail,
+                    &last_order_fail, tick_count,
                 ).await;
             }
         }
@@ -286,19 +290,44 @@ async fn evaluate_and_act(
     poly_client: &Option<Arc<PolyClient>>,
     fill_tx: &mpsc::Sender<ExecutedOrderUpdate>,
     last_order_fail: &Option<Instant>,
+    tick_count: u64,
 ) {
     if let Some(t) = last_order_fail {
-        if t.elapsed() < Duration::from_secs(ORDER_FAIL_COOLDOWN_SECS) {
+        let remaining = Duration::from_secs(ORDER_FAIL_COOLDOWN_SECS).saturating_sub(t.elapsed());
+        if !remaining.is_zero() {
+            if tick_count % EDGE_MONITOR_INTERVAL == 0 {
+                debug!(
+                    "[Cooldown] K={:.0} | {}s remaining",
+                    strike_price, remaining.as_secs()
+                );
+            }
             return;
         }
     }
 
-    let (_fair_value, buy_edge, sell_edge) =
+    let (fair_value, buy_edge, sell_edge) =
         compute_edges(sniper_strategy, binance_mid, best_ask, best_bid);
+
+    // Periodic edge monitor: show the nearest opportunity even when below threshold
+    if tick_count % EDGE_MONITOR_INTERVAL == 0 && best_ask > 0.0 {
+        let state_tag = match state {
+            PositionState::Empty => "EMPTY",
+            PositionState::PendingBuy { .. } => "P-BUY",
+            PositionState::Holding { .. } => "HOLD",
+            PositionState::PendingSell { .. } => "P-SELL",
+        };
+        info!(
+            "[Monitor] K={:.0} | FV:{:.4} Ask:{:.3} Bid:{:.3} | BuyEdge:{:.4} SellEdge:{:.4} | Thr:{:.3} | State:{} | BTC:{:.1}",
+            strike_price, fair_value, best_ask, best_bid, buy_edge, sell_edge, ENTER_THRESHOLD, state_tag, binance_mid,
+        );
+    }
 
     match state {
         PositionState::Empty => {
             if risk_guard.is_frozen() {
+                if tick_count % EDGE_MONITOR_INTERVAL == 0 {
+                    debug!("[Skipped] K={:.0} | Reason: circuit breaker frozen", strike_price);
+                }
                 return;
             }
 
@@ -307,13 +336,33 @@ async fn evaluate_and_act(
                 .check_market_exposure(yes_qty + sniper_strategy.snipe_size, no_qty)
                 .is_err()
             {
+                if tick_count % EDGE_MONITOR_INTERVAL == 0 {
+                    debug!(
+                        "[Skipped] K={:.0} | Reason: market exposure limit | yes:{:.2} no:{:.2}",
+                        strike_price, yes_qty, no_qty,
+                    );
+                }
                 return;
             }
 
             if best_ask > 0.0 && buy_edge > ENTER_THRESHOLD {
                 if !risk_guard.can_afford(best_ask, sniper_strategy.snipe_size) {
+                    if tick_count % EDGE_MONITOR_INTERVAL == 0 {
+                        let spent = risk_guard.current_spent();
+                        debug!(
+                            "[Skipped] K={:.0} | Reason: budget | Need:{:.2} Spent:{} Max:{}",
+                            strike_price,
+                            best_ask * sniper_strategy.snipe_size,
+                            spent,
+                            risk_guard.max_budget_f64(),
+                        );
+                    }
                     return;
                 }
+                info!(
+                    "[TRIGGER] K={:.0} | Edge:{:.4} > Thr:{:.3} | Ask:{:.3} FV:{:.4} | Spawning order...",
+                    strike_price, buy_edge, ENTER_THRESHOLD, best_ask, fair_value,
+                );
                 let signal = crate::strategy::SnipeSignal {
                     side: OrderSide::Buy,
                     target_price: best_ask,
@@ -333,6 +382,10 @@ async fn evaluate_and_act(
                 if sell_edge > EXIT_THRESHOLD || profit > MIN_PROFIT {
                     let sell_size = (*amount).min(current_position).max(0.0);
                     if sell_size > 0.0 {
+                        info!(
+                            "[TRIGGER-SELL] K={:.0} | SellEdge:{:.4} Profit:{:.4} | Bid:{:.3} BuyP:{:.3}",
+                            strike_price, sell_edge, profit, best_bid, buy_price,
+                        );
                         let signal = crate::strategy::SnipeSignal {
                             side: OrderSide::Sell,
                             target_price: best_bid,

@@ -17,6 +17,8 @@ pub struct AppConfig {
     /// Dry run mode: if true, NO REAL ORDERS will be placed (paper trading).
     /// Default: true (SAFETY FIRST - must explicitly set DRY_RUN=false for live trading).
     pub dry_run: bool,
+    /// Optional HTTPS proxy for outbound API calls (e.g. radar, gamma-api).
+    pub https_proxy: Option<String>,
 }
 
 impl AppConfig {
@@ -52,6 +54,11 @@ impl AppConfig {
             .map(|v| v.to_lowercase() != "false" && v != "0")
             .unwrap_or(true);
 
+        let https_proxy = env::var("HTTPS_PROXY")
+            .ok()
+            .or_else(|| env::var("https_proxy").ok())
+            .filter(|s| !s.is_empty());
+
         Self {
             binance_symbol,
             poly_token_id,
@@ -61,6 +68,7 @@ impl AppConfig {
             max_exposure_per_market,
             reconciliation_buffer_seconds,
             dry_run,
+            https_proxy,
         }
     }
 

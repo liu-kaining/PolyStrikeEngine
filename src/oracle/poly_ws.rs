@@ -9,6 +9,7 @@ use polymarket_client_sdk::clob::ws::{
     types::response::BookUpdate,
     Client as WsClient,
 };
+use rust_decimal::prelude::ToPrimitive;
 use tokio::sync::watch;
 use tracing::error;
 
@@ -23,8 +24,9 @@ const MAX_RETRIES: u32 = 10;
 const INITIAL_BACKOFF_MS: u64 = 1000;
 const MAX_BACKOFF_MS: u64 = 30_000;
 
+#[inline]
 fn decimal_to_f64(d: &polymarket_client_sdk::types::Decimal) -> f64 {
-    d.to_string().parse::<f64>().unwrap_or(0.0)
+    d.to_f64().unwrap_or(0.0)
 }
 
 fn book_update_to_ticker(book: &BookUpdate) -> PolyBookTicker {
