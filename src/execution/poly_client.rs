@@ -14,9 +14,10 @@ use polymarket_client_sdk::clob::types::{
     request::CancelMarketOrderRequest, Side as ClobSide, SignatureType,
 };
 use polymarket_client_sdk::types::{Address, Decimal};
+use polymarket_client_sdk::derive_safe_wallet;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
 use tokio::sync::Semaphore;
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::models::types::OrderSide;
 
@@ -48,30 +49,63 @@ impl PolyClient {
             .context("failed to parse PK into LocalSigner")?
             .with_chain_id(Some(chain_id.into()));
 
-        let funder_override = std::env::var("FUNDER_ADDRESS").ok();
-        let user_address = if let Some(funder) = funder_override.as_deref() {
-            funder.parse().context("invalid FUNDER_ADDRESS hex")?
-        } else {
-            signer.address()
-        };
+        let eoa_address = signer.address();
+        info!("[PolyClient] EOA address (from PK): {:?}", eoa_address);
+
+        // For MetaMask / browser wallets, Polymarket deploys a 1-of-1 Gnosis Safe.
+        // SDK will auto-derive this Safe address via CREATE2 when using SignatureType::GnosisSafe.
+        let auto_derived_safe = derive_safe_wallet(eoa_address, chain_id);
+        if let Some(ref safe) = auto_derived_safe {
+            info!("[PolyClient] Auto-derived Safe Wallet (CREATE2): {:?}", safe);
+        }
+
+        let funder_override = std::env::var("FUNDER_ADDRESS")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
+
+        if let Some(ref funder_str) = funder_override {
+            let funder_addr: Address = funder_str.parse().context("invalid FUNDER_ADDRESS hex")?;
+            if let Some(ref safe) = auto_derived_safe {
+                if funder_addr != *safe {
+                    warn!(
+                        "[PolyClient] ⚠️ FUNDER_ADDRESS {:?} does NOT match auto-derived Safe {:?}. \
+                         This will cause 'invalid signature' unless the FUNDER_ADDRESS is the correct Safe wallet. \
+                         Consider removing FUNDER_ADDRESS to let the SDK derive the Safe automatically.",
+                        funder_addr, safe
+                    );
+                }
+            }
+        }
+
+        let user_address = funder_override.as_deref()
+            .map(|f| f.parse().context("invalid FUNDER_ADDRESS hex"))
+            .transpose()?
+            .or(auto_derived_safe)
+            .unwrap_or(eoa_address);
 
         let base_client =
             ClobClient::new(DEFAULT_CLOB_URL, ClobConfig::default()).context("init CLOB client")?;
 
         let mut auth_builder = base_client.authentication_builder(&signer);
-        auth_builder = auth_builder.signature_type(SignatureType::Proxy);
+        // MetaMask / browser wallet path: use Gnosis Safe signature type.
+        auth_builder = auth_builder.signature_type(SignatureType::GnosisSafe);
 
-        if let Some(funder) = funder_override {
-            let addr: Address = funder
+        if let Some(funder_str) = funder_override {
+            let addr: Address = funder_str
                 .parse()
                 .context("invalid FUNDER_ADDRESS hex")?;
             auth_builder = auth_builder.funder(addr);
+            info!("[PolyClient] Using explicit FUNDER_ADDRESS (Safe): {:?}", addr);
+        } else {
+            info!("[PolyClient] No FUNDER_ADDRESS set — SDK will auto-derive Safe wallet via CREATE2.");
         }
 
         let client = auth_builder
             .authenticate()
             .await
             .context("failed to authenticate Polymarket client")?;
+
+        info!("[PolyClient] Authenticated. user_address (for data API): {:?}", user_address);
 
         Ok(Self {
             client,
@@ -132,10 +166,27 @@ impl PolyClient {
                 .await
                 .context("failed to sign order")?;
 
+            let order_payload_json = serde_json::to_string(&signed);
+
             match self.client.post_order(signed).await {
                 Ok(resp) => return Ok(resp.order_id),
                 Err(e) => {
                     let err = anyhow::Error::from(e).context("failed to post order");
+                    let err_str = format!("{:#}", err);
+
+                    if err_str.contains("invalid signature") {
+                        tracing::error!(
+                            "[PolyClient] SIGNATURE REJECTED — dumping order payload for diagnosis:\n\
+                             signer_eoa={:?}\n\
+                             order_json={}\n\
+                             token_id={}\n\
+                             side={:?} price={} size={}",
+                            self.signer.address(),
+                            order_payload_json.as_deref().unwrap_or("<serialization failed>"),
+                            token_id, side, price, size,
+                        );
+                    }
+
                     if Self::is_rate_limited(&err) && attempt < MAX_429_RETRIES {
                         warn!(
                             "[PolyClient] 429 rate limited (attempt {}/{}), backing off {}ms",

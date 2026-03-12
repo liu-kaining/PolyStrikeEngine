@@ -2,6 +2,10 @@
 
 use serde::Deserialize;
 
+fn default_volatility() -> f64 {
+    0.80
+}
+
 /// Request body for starting a sniper strategy on a market.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StartStrategyReq {
@@ -9,6 +13,7 @@ pub struct StartStrategyReq {
     pub strike_price: f64,
     pub snipe_size: f64,
     pub expiry_timestamp: i64,
+    #[serde(default = "default_volatility")]
     pub volatility: f64,
 }
 
@@ -21,6 +26,7 @@ pub struct StopStrategyReq {
 #[derive(Debug, Clone, Deserialize)]
 pub struct StartEventRadarReq {
     pub event_slug: String,
+    #[serde(default = "default_volatility")]
     pub volatility: f64,
     pub snipe_size: f64,
 }

@@ -14,13 +14,13 @@ use crate::oracle::poly_ws;
 use crate::risk::{BudgetReservation, InventoryManager, RiskGuard};
 use crate::strategy::SniperStrategy;
 
-const ENTER_THRESHOLD: f64 = 0.005;
-const EXIT_THRESHOLD: f64 = 0.005;
-const MIN_PROFIT: f64 = 0.008;
+const ENTER_THRESHOLD: f64 = 0.0005;
+const EXIT_THRESHOLD: f64 = 0.001;
+const MIN_PROFIT: f64 = 0.002;
 const ORDER_TIMEOUT_SECS: u64 = 5;
 const PENDING_WATCHDOG_SECS: u64 = 8;
 const ORDER_FAIL_COOLDOWN_SECS: u64 = 5;
-const EDGE_MONITOR_INTERVAL: u64 = 500;
+const EDGE_MONITOR_INTERVAL: u64 = 5000;
 
 #[derive(Debug, Clone)]
 struct ExecutedOrderUpdate {
@@ -308,8 +308,9 @@ async fn evaluate_and_act(
     let (fair_value, buy_edge, sell_edge) =
         compute_edges(sniper_strategy, binance_mid, best_ask, best_bid);
 
-    // Periodic edge monitor: show the nearest opportunity even when below threshold
-    if tick_count % EDGE_MONITOR_INTERVAL == 0 && best_ask > 0.0 {
+    // Only log markets with meaningful edge or liquidity (reduce noise)
+    let is_interesting = buy_edge > -0.01 && (best_bid > 0.01 || best_ask < 0.99);
+    if tick_count % EDGE_MONITOR_INTERVAL == 0 && best_ask > 0.0 && is_interesting {
         let state_tag = match state {
             PositionState::Empty => "EMPTY",
             PositionState::PendingBuy { .. } => "P-BUY",
@@ -346,7 +347,22 @@ async fn evaluate_and_act(
             }
 
             if best_ask > 0.0 && buy_edge > ENTER_THRESHOLD {
+                // Strict single-shot protection: if ANY market currently has a BUY in-flight,
+                // we must not trigger another BUY. This enforces "one bullet at a time"
+                // for very small accounts.
+                if !risk_guard.try_acquire_global_buy_slot() {
+                    if tick_count % EDGE_MONITOR_INTERVAL == 0 {
+                        debug!(
+                            "[Skipped] K={:.0} | Reason: global PendingBuy in another market",
+                            strike_price
+                        );
+                    }
+                    return;
+                }
+
                 if !risk_guard.can_afford(best_ask, sniper_strategy.snipe_size) {
+                    // We acquired the global slot but cannot afford; release immediately.
+                    risk_guard.release_global_buy_slot();
                     if tick_count % EDGE_MONITOR_INTERVAL == 0 {
                         let spent = risk_guard.current_spent();
                         debug!(
@@ -500,7 +516,7 @@ async fn try_fire(
         return;
     }
 
-    info!("[FIRE][K={:.0}] Triggering snipe order: {:?}", strike_price, signal);
+    debug!("[FIRE][K={:.0}] Triggering snipe order: {:?}", strike_price, signal);
 
     let Some(client) = poly_client else {
         error!("[FIRE] PolyClient not available, releasing budget.");
@@ -511,85 +527,108 @@ async fn try_fire(
         return;
     };
 
-    let op = {
-        let client = client.clone();
-        let token_id = token_id.clone();
-        let inv = inventory.clone();
-        async move {
-            let before = client
-                .sync_token_position(token_id.as_str())
-                .await
-                .unwrap_or_else(|_| inv.get_net_exposure(token_id.as_str()).max(0.0));
+    let client = client.clone();
+    let token_id_clone = token_id.clone();
+    let inv = inventory.clone();
 
-            let order_id = client
-                .execute_snipe_order(token_id.as_str(), signal.side, signal.target_price, signal.size)
-                .await?;
+    let before = client
+        .sync_token_position(token_id_clone.as_str())
+        .await
+        .unwrap_or_else(|_| inv.get_net_exposure(token_id_clone.as_str()).max(0.0));
 
-            info!("[FIRE][K={:.0}] Order placed: {}", strike_price, order_id);
+    // Only put a hard timeout around the RPC to place the order.
+    // Subsequent on-chain confirmation + position sync are allowed to take longer
+    // without being treated as a hard failure, to avoid "false timeout" warnings.
+    let place_result = tokio::time::timeout(
+        Duration::from_secs(ORDER_TIMEOUT_SECS),
+        client.execute_snipe_order(
+            token_id_clone.as_str(),
+            signal.side,
+            signal.target_price,
+            signal.size,
+        ),
+    )
+    .await;
 
-            tokio::time::sleep(Duration::from_millis(800)).await;
-
-            let after = client
-                .sync_token_position(token_id.as_str())
-                .await
-                .unwrap_or(before);
-
-            Ok::<(f64, f64), anyhow::Error>((before, after))
-        }
-    };
-
-    let timed = tokio::time::timeout(Duration::from_secs(ORDER_TIMEOUT_SECS), op).await;
-
-    match timed {
-        Ok(Ok((before, after))) => {
-            let actual_filled = match signal.side {
-                OrderSide::Buy => (after - before).max(0.0),
-                OrderSide::Sell => (before - after).max(0.0),
-            };
-
-            if actual_filled <= f64::EPSILON {
-                info!(
-                    "[HFT-WARN] ⚠️ 订单超时或未成交，状态机已安全回滚锁。 side={:?}, K={:.0}",
-                    signal.side, strike_price
-                );
-                if let Some(ref res) = reservation {
-                    risk_guard.release_budget(res.as_ref().clone_for_release());
-                }
-                let _ = fill_tx.send(ExecutedOrderUpdate {
-                    side: signal.side, price: signal.target_price, size: 0.0,
-                    synced_position: after.max(0.0), edge_hint, success: false, reservation: None,
-                }).await;
-                return;
-            }
-
-            inventory.apply_fill(token_id.as_str(), true, signal.side, actual_filled, signal.target_price);
-
-            if matches!(signal.side, OrderSide::Sell) {
-                risk_guard.refund_budget_on_sell(signal.target_price, actual_filled);
-            }
-
-            let _ = fill_tx.send(ExecutedOrderUpdate {
-                side: signal.side, price: signal.target_price, size: actual_filled,
-                synced_position: after.max(0.0), edge_hint, success: true,
-                reservation: reservation.clone(),
-            }).await;
-        }
+    let order_id = match place_result {
+        Ok(Ok(id)) => id,
         Ok(Err(e)) => {
             error!("[FIRE][K={:.0}] Order failed: {:#?}, releasing budget", strike_price, e);
             if let Some(ref res) = reservation {
                 risk_guard.release_budget(res.as_ref().clone_for_release());
             }
             let _ = fill_tx.send(fail_update(None)).await;
+            return;
         }
         Err(_) => {
             warn!(
-                "[HFT-WARN] ⚠️ 下单流程在 {}s 超时内未完成，状态机将回滚。 side={:?}, K={:.0}",
+                "[HFT-WARN] ⚠️ execute_snipe_order 在 {}s 内未返回，状态机将回滚。 side={:?}, K={:.0}",
                 ORDER_TIMEOUT_SECS, signal.side, strike_price
             );
             if let Some(ref res) = reservation {
                 risk_guard.release_budget(res.as_ref().clone_for_release());
             }
             let _ = fill_tx.send(fail_update(None)).await;
+            return;
         }
+    };
+
+    info!("[FIRE][K={:.0}] Order placed: {}", strike_price, order_id);
+
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let after = client
+        .sync_token_position(token_id_clone.as_str())
+        .await
+        .unwrap_or(before);
+
+    let actual_filled = match signal.side {
+        OrderSide::Buy => (after - before).max(0.0),
+        OrderSide::Sell => (before - after).max(0.0),
+    };
+
+    if actual_filled <= f64::EPSILON {
+        info!(
+            "[HFT-WARN] ⚠️ 订单超时或未成交，状态机已安全回滚锁。 side={:?}, K={:.0}",
+            signal.side, strike_price
+        );
+        if let Some(ref res) = reservation {
+            risk_guard.release_budget(res.as_ref().clone_for_release());
+        }
+        let _ = fill_tx.send(ExecutedOrderUpdate {
+            side: signal.side,
+            price: signal.target_price,
+            size: 0.0,
+            synced_position: after.max(0.0),
+            edge_hint,
+            success: false,
+            reservation: None,
+        })
+        .await;
+        return;
     }
+
+    inventory.apply_fill(
+        token_id.as_str(),
+        true,
+        signal.side,
+        actual_filled,
+        signal.target_price,
+    );
+
+    if matches!(signal.side, OrderSide::Sell) {
+        risk_guard.refund_budget_on_sell(signal.target_price, actual_filled);
+    }
+
+    let _ = fill_tx
+        .send(ExecutedOrderUpdate {
+            side: signal.side,
+            price: signal.target_price,
+            size: actual_filled,
+            synced_position: after.max(0.0),
+            edge_hint,
+            success: true,
+            reservation: reservation.clone(),
+        })
+        .await;
 }

@@ -4,6 +4,7 @@
 //! All Decimal->f64 conversions use ToPrimitive (zero-allocation) instead of to_string().parse().
 
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -21,6 +22,9 @@ pub struct RiskGuard {
     max_budget: Decimal,
     max_exposure_per_market: Decimal,
     frozen: RwLock<bool>,
+    /// Global flag: whether there is a BUY order in-flight anywhere in the system.
+    /// Used to ensure we only have one outstanding BUY at a time (for tiny accounts).
+    pending_buy_in_flight: AtomicBool,
 }
 
 #[allow(dead_code)]
@@ -31,6 +35,7 @@ impl RiskGuard {
             max_budget: Decimal::from_f64_retain(max_budget).unwrap_or(Decimal::MAX),
             max_exposure_per_market: Decimal::ZERO,
             frozen: RwLock::new(false),
+            pending_buy_in_flight: AtomicBool::new(false),
         }
     }
 
@@ -168,6 +173,23 @@ impl RiskGuard {
             .read()
             .map(|r| *r)
             .unwrap_or(Decimal::ZERO)
+    }
+
+    /// Try to acquire the global BUY slot. Returns true if we successfully
+    /// became the single in-flight BUY; false if another BUY is already running.
+    pub fn try_acquire_global_buy_slot(&self) -> bool {
+        // swap returns previous value; only succeed if it was false.
+        !self.pending_buy_in_flight.swap(true, Ordering::AcqRel)
+    }
+
+    /// Release the global BUY slot, allowing another market to fire.
+    pub fn release_global_buy_slot(&self) {
+        self.pending_buy_in_flight.store(false, Ordering::Release);
+    }
+
+    /// Read-only check for diagnostics.
+    pub fn is_global_buy_in_flight(&self) -> bool {
+        self.pending_buy_in_flight.load(Ordering::Acquire)
     }
 }
 
