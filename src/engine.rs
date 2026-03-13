@@ -17,7 +17,7 @@ use crate::strategy::SniperStrategy;
 // Default engine parameters (can be overridden via ENV at runtime).
 const ENTER_THRESHOLD_DEFAULT: f64 = 0.001;   // 0.1% edge to enter
 const EXIT_THRESHOLD_DEFAULT: f64 = 0.002;    // 0.2% edge to exit
-const MIN_PROFIT_DEFAULT: f64 = 0.001;        // 0.1% profit to take
+const MIN_PROFIT_DEFAULT: f64 = 0.0005;       // 0.05% profit to take
 const ORDER_TIMEOUT_SECS_DEFAULT: u64 = 5;
 const PENDING_WATCHDOG_SECS_DEFAULT: u64 = 8;
 const ORDER_FAIL_COOLDOWN_SECS_DEFAULT: u64 = 2;
@@ -335,6 +335,17 @@ async fn evaluate_and_act(
     last_order_fail: &Option<Instant>,
     tick_count: u64,
 ) {
+    // If available cash is below the Polymarket minimum order notional (~$1),
+    // keep the engine completely silent until funds are replenished via sells.
+    let max_budget = risk_guard.max_budget_f64();
+    if max_budget > 0.0 {
+        let spent = risk_guard.current_spent();
+        let available_cash = (max_budget - spent.to_f64().unwrap_or(0.0)).max(0.0);
+        if available_cash < 1.0 {
+            return;
+        }
+    }
+
     if let Some(t) = last_order_fail {
         let remaining = Duration::from_secs(order_fail_cooldown_secs()).saturating_sub(t.elapsed());
         if !remaining.is_zero() {
@@ -375,21 +386,48 @@ async fn evaluate_and_act(
                 return;
             }
 
-            let (yes_qty, no_qty) = inventory.get_exposure_qty(token_id);
-            if risk_guard
-                .check_market_exposure(yes_qty + sniper_strategy.snipe_size, no_qty)
-                .is_err()
-            {
-                if tick_count % edge_monitor_interval() == 0 {
-                    debug!(
-                        "[Skipped] K={:.0} | Reason: market exposure limit | yes:{:.2} no:{:.2}",
-                        strike_price, yes_qty, no_qty,
-                    );
-                }
-                return;
-            }
-
             if best_ask > 0.0 && buy_edge > enter_threshold() {
+                // Interpret snipe_size as USD budget per shot.
+                let budget_per_trade = sniper_strategy.snipe_size;
+                let shares_to_buy = (budget_per_trade / best_ask).floor();
+
+                // Require at least 1 share notionally.
+                if shares_to_buy < 1.0 {
+                    if tick_count % edge_monitor_interval() == 0 {
+                        debug!(
+                            "[Skipped] K={:.0} | Reason: budget per trade too small | Budget:{:.4} Ask:{:.4}",
+                            strike_price, budget_per_trade, best_ask,
+                        );
+                    }
+                    return;
+                }
+
+                let notional = shares_to_buy * best_ask;
+                // Polymarket minimum order notional is ~$1.
+                if notional < 1.0 {
+                    if tick_count % edge_monitor_interval() == 0 {
+                        debug!(
+                            "[Skipped] K={:.0} | Reason: notional < $1.0 | Notional:{:.4}",
+                            strike_price, notional,
+                        );
+                    }
+                    return;
+                }
+
+                let (yes_qty, no_qty) = inventory.get_exposure_qty(token_id);
+                if risk_guard
+                    .check_market_exposure(yes_qty + shares_to_buy, no_qty)
+                    .is_err()
+                {
+                    if tick_count % edge_monitor_interval() == 0 {
+                        debug!(
+                            "[Skipped] K={:.0} | Reason: market exposure limit | yes:{:.2} no:{:.2}",
+                            strike_price, yes_qty, no_qty,
+                        );
+                    }
+                    return;
+                }
+
                 // Strict single-shot protection: if ANY market currently has a BUY in-flight,
                 // we must not trigger another BUY. This enforces "one bullet at a time"
                 // for very small accounts.
@@ -403,7 +441,8 @@ async fn evaluate_and_act(
                     return;
                 }
 
-                if !risk_guard.can_afford(best_ask, sniper_strategy.snipe_size) {
+                // Check that the USD budget per shot fits inside remaining global budget.
+                if !risk_guard.can_afford(1.0, sniper_strategy.snipe_size) {
                     // We acquired the global slot but cannot afford; release immediately.
                     risk_guard.release_global_buy_slot();
                     if tick_count % edge_monitor_interval() == 0 {
@@ -411,7 +450,7 @@ async fn evaluate_and_act(
                         debug!(
                             "[Skipped] K={:.0} | Reason: budget | Need:{:.2} Spent:{} Max:{}",
                             strike_price,
-                            best_ask * sniper_strategy.snipe_size,
+                            sniper_strategy.snipe_size,
                             spent,
                             risk_guard.max_budget_f64(),
                         );
@@ -425,7 +464,7 @@ async fn evaluate_and_act(
                 let signal = crate::strategy::SnipeSignal {
                     side: OrderSide::Buy,
                     target_price: best_ask,
-                    size: sniper_strategy.snipe_size,
+                    size: shares_to_buy,
                 };
                 tokio::spawn(try_fire(
                     risk_guard.clone(), inventory.clone(), poly_client.clone(),
@@ -539,6 +578,9 @@ async fn try_fire(
             Ok(r) => Some(Arc::new(r)),
             Err(e) => {
                 debug!("[RiskGuard] ⛔ Budget rejected (race): {}", e);
+                if matches!(signal.side, OrderSide::Buy) {
+                    risk_guard.release_global_buy_slot();
+                }
                 let _ = fill_tx.send(fail_update(None)).await;
                 return;
             }
@@ -555,6 +597,9 @@ async fn try_fire(
         if let Some(ref res) = reservation {
             risk_guard.release_budget(res.as_ref().clone_for_release());
         }
+        if matches!(signal.side, OrderSide::Buy) {
+            risk_guard.release_global_buy_slot();
+        }
         let _ = fill_tx.send(fail_update(None)).await;
         return;
     }
@@ -565,6 +610,9 @@ async fn try_fire(
         error!("[FIRE] PolyClient not available, releasing budget.");
         if let Some(ref res) = reservation {
             risk_guard.release_budget(res.as_ref().clone_for_release());
+        }
+        if matches!(signal.side, OrderSide::Buy) {
+            risk_guard.release_global_buy_slot();
         }
         let _ = fill_tx.send(fail_update(None)).await;
         return;
@@ -600,6 +648,9 @@ async fn try_fire(
             if let Some(ref res) = reservation {
                 risk_guard.release_budget(res.as_ref().clone_for_release());
             }
+            if matches!(signal.side, OrderSide::Buy) {
+                risk_guard.release_global_buy_slot();
+            }
             let _ = fill_tx.send(fail_update(None)).await;
             return;
         }
@@ -611,6 +662,9 @@ async fn try_fire(
             if let Some(ref res) = reservation {
                 risk_guard.release_budget(res.as_ref().clone_for_release());
             }
+            if matches!(signal.side, OrderSide::Buy) {
+                risk_guard.release_global_buy_slot();
+            }
             let _ = fill_tx.send(fail_update(None)).await;
             return;
         }
@@ -618,7 +672,9 @@ async fn try_fire(
 
     info!("[FIRE][K={:.0}] Order placed: {}", strike_price, order_id);
 
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    // High-frequency mode: wait briefly for a fill snapshot. If position
+    // hasn't changed after ~1.5s, treat as no-fill and free the global BUY slot.
+    tokio::time::sleep(Duration::from_millis(1500)).await;
 
     let after = client
         .sync_token_position(token_id_clone.as_str())
@@ -637,6 +693,9 @@ async fn try_fire(
         );
         if let Some(ref res) = reservation {
             risk_guard.release_budget(res.as_ref().clone_for_release());
+        }
+        if matches!(signal.side, OrderSide::Buy) {
+            risk_guard.release_global_buy_slot();
         }
         let _ = fill_tx.send(ExecutedOrderUpdate {
             side: signal.side,
@@ -674,4 +733,7 @@ async fn try_fire(
             reservation: reservation.clone(),
         })
         .await;
+    if matches!(signal.side, OrderSide::Buy) {
+        risk_guard.release_global_buy_slot();
+    }
 }
