@@ -4,7 +4,7 @@
 //! All Decimal->f64 conversions use ToPrimitive (zero-allocation) instead of to_string().parse().
 
 use std::sync::RwLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -22,9 +22,18 @@ pub struct RiskGuard {
     max_budget: Decimal,
     max_exposure_per_market: Decimal,
     frozen: RwLock<bool>,
-    /// Global flag: whether there is a BUY order in-flight anywhere in the system.
-    /// Used to ensure we only have one outstanding BUY at a time (for tiny accounts).
-    pending_buy_in_flight: AtomicBool,
+    /// Number of BUY orders currently in-flight. Max 2 for small accounts to double fire rate.
+    pending_buy_count: AtomicU8,
+}
+
+const MAX_CONCURRENT_BUYS_DEFAULT: u8 = 2;
+
+fn max_concurrent_buys() -> u8 {
+    std::env::var("MAX_CONCURRENT_BUYS")
+        .ok()
+        .and_then(|v| v.parse::<u8>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(MAX_CONCURRENT_BUYS_DEFAULT)
 }
 
 #[allow(dead_code)]
@@ -35,7 +44,7 @@ impl RiskGuard {
             max_budget: Decimal::from_f64_retain(max_budget).unwrap_or(Decimal::MAX),
             max_exposure_per_market: Decimal::ZERO,
             frozen: RwLock::new(false),
-            pending_buy_in_flight: AtomicBool::new(false),
+            pending_buy_count: AtomicU8::new(0),
         }
     }
 
@@ -175,21 +184,24 @@ impl RiskGuard {
             .unwrap_or(Decimal::ZERO)
     }
 
-    /// Try to acquire the global BUY slot. Returns true if we successfully
-    /// became the single in-flight BUY; false if another BUY is already running.
+    /// Try to acquire a BUY slot. Returns true if we have room (max 2 concurrent).
     pub fn try_acquire_global_buy_slot(&self) -> bool {
-        // swap returns previous value; only succeed if it was false.
-        !self.pending_buy_in_flight.swap(true, Ordering::AcqRel)
+        let count = self.pending_buy_count.fetch_add(1, Ordering::AcqRel);
+        if count >= max_concurrent_buys() {
+            self.pending_buy_count.fetch_sub(1, Ordering::AcqRel);
+            return false;
+        }
+        true
     }
 
-    /// Release the global BUY slot, allowing another market to fire.
+    /// Release a BUY slot when order completes (success or fail).
     pub fn release_global_buy_slot(&self) {
-        self.pending_buy_in_flight.store(false, Ordering::Release);
+        self.pending_buy_count.fetch_sub(1, Ordering::AcqRel);
     }
 
     /// Read-only check for diagnostics.
     pub fn is_global_buy_in_flight(&self) -> bool {
-        self.pending_buy_in_flight.load(Ordering::Acquire)
+        self.pending_buy_count.load(Ordering::Acquire) > 0
     }
 }
 

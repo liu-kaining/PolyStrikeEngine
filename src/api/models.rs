@@ -6,6 +6,10 @@ fn default_volatility() -> f64 {
     0.80
 }
 
+fn default_snipe_size() -> f64 {
+    3.0
+}
+
 /// Request body for starting a sniper strategy on a market.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StartStrategyReq {
@@ -28,5 +32,6 @@ pub struct StartEventRadarReq {
     pub event_slug: String,
     #[serde(default = "default_volatility")]
     pub volatility: f64,
+    #[serde(default = "default_snipe_size")]
     pub snipe_size: f64,
 }

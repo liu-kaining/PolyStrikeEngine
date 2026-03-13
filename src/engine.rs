@@ -14,13 +14,56 @@ use crate::oracle::poly_ws;
 use crate::risk::{BudgetReservation, InventoryManager, RiskGuard};
 use crate::strategy::SniperStrategy;
 
-const ENTER_THRESHOLD: f64 = 0.0005;
-const EXIT_THRESHOLD: f64 = 0.001;
-const MIN_PROFIT: f64 = 0.002;
-const ORDER_TIMEOUT_SECS: u64 = 5;
-const PENDING_WATCHDOG_SECS: u64 = 8;
-const ORDER_FAIL_COOLDOWN_SECS: u64 = 5;
-const EDGE_MONITOR_INTERVAL: u64 = 5000;
+// Default engine parameters (can be overridden via ENV at runtime).
+const ENTER_THRESHOLD_DEFAULT: f64 = 0.001;   // 0.1% edge to enter
+const EXIT_THRESHOLD_DEFAULT: f64 = 0.002;    // 0.2% edge to exit
+const MIN_PROFIT_DEFAULT: f64 = 0.001;        // 0.1% profit to take
+const ORDER_TIMEOUT_SECS_DEFAULT: u64 = 5;
+const PENDING_WATCHDOG_SECS_DEFAULT: u64 = 8;
+const ORDER_FAIL_COOLDOWN_SECS_DEFAULT: u64 = 2;
+const EDGE_MONITOR_INTERVAL_DEFAULT: u64 = 5000;
+
+fn env_f64(name: &str, default: f64) -> f64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn enter_threshold() -> f64 {
+    env_f64("ENTER_THRESHOLD", ENTER_THRESHOLD_DEFAULT)
+}
+
+fn exit_threshold() -> f64 {
+    env_f64("EXIT_THRESHOLD", EXIT_THRESHOLD_DEFAULT)
+}
+
+fn min_profit() -> f64 {
+    env_f64("MIN_PROFIT", MIN_PROFIT_DEFAULT)
+}
+
+fn order_timeout_secs() -> u64 {
+    env_u64("ORDER_TIMEOUT_SECS", ORDER_TIMEOUT_SECS_DEFAULT)
+}
+
+fn pending_watchdog_secs() -> u64 {
+    env_u64("PENDING_WATCHDOG_SECS", PENDING_WATCHDOG_SECS_DEFAULT)
+}
+
+fn order_fail_cooldown_secs() -> u64 {
+    env_u64("ORDER_FAIL_COOLDOWN_SECS", ORDER_FAIL_COOLDOWN_SECS_DEFAULT)
+}
+
+fn edge_monitor_interval() -> u64 {
+    env_u64("EDGE_MONITOR_INTERVAL", EDGE_MONITOR_INTERVAL_DEFAULT)
+}
 
 #[derive(Debug, Clone)]
 struct ExecutedOrderUpdate {
@@ -142,7 +185,7 @@ pub async fn run_sniper_task(
                         if update.reservation.is_some() || update.size > 0.0 {
                             info!(
                                 "[HFT-ENTER] ❌ K={:.0} | Buy failed at {:.3} | Edge:{:.4} | Cooldown {}s",
-                                strike_price, update.price, update.edge_hint, ORDER_FAIL_COOLDOWN_SECS,
+                                strike_price, update.price, update.edge_hint, order_fail_cooldown_secs(),
                             );
                         }
                         last_order_fail = Some(Instant::now());
@@ -166,7 +209,7 @@ pub async fn run_sniper_task(
                     (PositionState::PendingSell { buy_price, amount, amount_trying_to_sell, .. }, OrderSide::Sell, false) => {
                         info!(
                             "[HFT-EXIT] ❌ K={:.0} | Sell failed at {:.3} | Buy:{:.3} | Size:{:.2} | Cooldown {}s",
-                            strike_price, update.price, buy_price, amount_trying_to_sell, ORDER_FAIL_COOLDOWN_SECS,
+                            strike_price, update.price, buy_price, amount_trying_to_sell, order_fail_cooldown_secs(),
                         );
                         last_order_fail = Some(Instant::now());
                         PositionState::Holding { buy_price, amount }
@@ -201,7 +244,7 @@ pub async fn run_sniper_task(
                 }
                 match &state {
                     PositionState::PendingBuy { entered_at } => {
-                        if entered_at.elapsed() > Duration::from_secs(PENDING_WATCHDOG_SECS) {
+                        if entered_at.elapsed() > Duration::from_secs(pending_watchdog_secs()) {
                             warn!(
                                 "[Watchdog] ⏰ K={:.0} PendingBuy stuck for {}s, force-unlocking to Empty",
                                 strike_price, entered_at.elapsed().as_secs()
@@ -210,7 +253,7 @@ pub async fn run_sniper_task(
                         }
                     }
                     PositionState::PendingSell { buy_price, amount, entered_at, .. } => {
-                        if entered_at.elapsed() > Duration::from_secs(PENDING_WATCHDOG_SECS) {
+                        if entered_at.elapsed() > Duration::from_secs(pending_watchdog_secs()) {
                             warn!(
                                 "[Watchdog] ⏰ K={:.0} PendingSell stuck for {}s, force-unlocking to Holding",
                                 strike_price, entered_at.elapsed().as_secs()
@@ -293,9 +336,9 @@ async fn evaluate_and_act(
     tick_count: u64,
 ) {
     if let Some(t) = last_order_fail {
-        let remaining = Duration::from_secs(ORDER_FAIL_COOLDOWN_SECS).saturating_sub(t.elapsed());
+        let remaining = Duration::from_secs(order_fail_cooldown_secs()).saturating_sub(t.elapsed());
         if !remaining.is_zero() {
-            if tick_count % EDGE_MONITOR_INTERVAL == 0 {
+            if tick_count % edge_monitor_interval() == 0 {
                 debug!(
                     "[Cooldown] K={:.0} | {}s remaining",
                     strike_price, remaining.as_secs()
@@ -310,7 +353,7 @@ async fn evaluate_and_act(
 
     // Only log markets with meaningful edge or liquidity (reduce noise)
     let is_interesting = buy_edge > -0.01 && (best_bid > 0.01 || best_ask < 0.99);
-    if tick_count % EDGE_MONITOR_INTERVAL == 0 && best_ask > 0.0 && is_interesting {
+    if tick_count % edge_monitor_interval() == 0 && best_ask > 0.0 && is_interesting {
         let state_tag = match state {
             PositionState::Empty => "EMPTY",
             PositionState::PendingBuy { .. } => "P-BUY",
@@ -319,14 +362,14 @@ async fn evaluate_and_act(
         };
         info!(
             "[Monitor] K={:.0} | FV:{:.4} Ask:{:.3} Bid:{:.3} | BuyEdge:{:.4} SellEdge:{:.4} | Thr:{:.3} | State:{} | BTC:{:.1}",
-            strike_price, fair_value, best_ask, best_bid, buy_edge, sell_edge, ENTER_THRESHOLD, state_tag, binance_mid,
+            strike_price, fair_value, best_ask, best_bid, buy_edge, sell_edge, enter_threshold(), state_tag, binance_mid,
         );
     }
 
     match state {
         PositionState::Empty => {
             if risk_guard.is_frozen() {
-                if tick_count % EDGE_MONITOR_INTERVAL == 0 {
+                if tick_count % edge_monitor_interval() == 0 {
                     debug!("[Skipped] K={:.0} | Reason: circuit breaker frozen", strike_price);
                 }
                 return;
@@ -337,7 +380,7 @@ async fn evaluate_and_act(
                 .check_market_exposure(yes_qty + sniper_strategy.snipe_size, no_qty)
                 .is_err()
             {
-                if tick_count % EDGE_MONITOR_INTERVAL == 0 {
+                if tick_count % edge_monitor_interval() == 0 {
                     debug!(
                         "[Skipped] K={:.0} | Reason: market exposure limit | yes:{:.2} no:{:.2}",
                         strike_price, yes_qty, no_qty,
@@ -346,12 +389,12 @@ async fn evaluate_and_act(
                 return;
             }
 
-            if best_ask > 0.0 && buy_edge > ENTER_THRESHOLD {
+            if best_ask > 0.0 && buy_edge > enter_threshold() {
                 // Strict single-shot protection: if ANY market currently has a BUY in-flight,
                 // we must not trigger another BUY. This enforces "one bullet at a time"
                 // for very small accounts.
                 if !risk_guard.try_acquire_global_buy_slot() {
-                    if tick_count % EDGE_MONITOR_INTERVAL == 0 {
+                    if tick_count % edge_monitor_interval() == 0 {
                         debug!(
                             "[Skipped] K={:.0} | Reason: global PendingBuy in another market",
                             strike_price
@@ -363,7 +406,7 @@ async fn evaluate_and_act(
                 if !risk_guard.can_afford(best_ask, sniper_strategy.snipe_size) {
                     // We acquired the global slot but cannot afford; release immediately.
                     risk_guard.release_global_buy_slot();
-                    if tick_count % EDGE_MONITOR_INTERVAL == 0 {
+                    if tick_count % edge_monitor_interval() == 0 {
                         let spent = risk_guard.current_spent();
                         debug!(
                             "[Skipped] K={:.0} | Reason: budget | Need:{:.2} Spent:{} Max:{}",
@@ -377,7 +420,7 @@ async fn evaluate_and_act(
                 }
                 info!(
                     "[TRIGGER] K={:.0} | Edge:{:.4} > Thr:{:.3} | Ask:{:.3} FV:{:.4} | Spawning order...",
-                    strike_price, buy_edge, ENTER_THRESHOLD, best_ask, fair_value,
+                    strike_price, buy_edge, enter_threshold(), best_ask, fair_value,
                 );
                 let signal = crate::strategy::SnipeSignal {
                     side: OrderSide::Buy,
@@ -395,7 +438,7 @@ async fn evaluate_and_act(
         PositionState::Holding { buy_price, amount } => {
             if best_bid > 0.0 {
                 let profit = best_bid - *buy_price;
-                if sell_edge > EXIT_THRESHOLD || profit > MIN_PROFIT {
+                if sell_edge > exit_threshold() || profit > min_profit() {
                     let sell_size = (*amount).min(current_position).max(0.0);
                     if sell_size > 0.0 {
                         info!(
@@ -540,7 +583,7 @@ async fn try_fire(
     // Subsequent on-chain confirmation + position sync are allowed to take longer
     // without being treated as a hard failure, to avoid "false timeout" warnings.
     let place_result = tokio::time::timeout(
-        Duration::from_secs(ORDER_TIMEOUT_SECS),
+        Duration::from_secs(order_timeout_secs()),
         client.execute_snipe_order(
             token_id_clone.as_str(),
             signal.side,
@@ -563,7 +606,7 @@ async fn try_fire(
         Err(_) => {
             warn!(
                 "[HFT-WARN] ⚠️ execute_snipe_order 在 {}s 内未返回，状态机将回滚。 side={:?}, K={:.0}",
-                ORDER_TIMEOUT_SECS, signal.side, strike_price
+                order_timeout_secs(), signal.side, strike_price
             );
             if let Some(ref res) = reservation {
                 risk_guard.release_budget(res.as_ref().clone_for_release());
