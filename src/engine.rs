@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use rust_decimal::prelude::ToPrimitive;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -335,14 +336,21 @@ async fn evaluate_and_act(
     last_order_fail: &Option<Instant>,
     tick_count: u64,
 ) {
-    // If available cash is below the Polymarket minimum order notional (~$1),
-    // keep the engine completely silent until funds are replenished via sells.
-    let max_budget = risk_guard.max_budget_f64();
-    if max_budget > 0.0 {
-        let spent = risk_guard.current_spent();
-        let available_cash = (max_budget - spent.to_f64().unwrap_or(0.0)).max(0.0);
-        if available_cash < 1.0 {
-            return;
+    // When Empty: if available cash is below ~$1, hibernate to avoid "not enough balance" spam.
+    // When Holding/Pending*: never skip — we must always allow selling (no cash needed).
+    if matches!(state, PositionState::Empty) {
+        let max_budget = risk_guard.max_budget_f64();
+        if max_budget > 0.0 {
+            let spent = risk_guard.current_spent();
+            let available_cash = (max_budget - spent.to_f64().unwrap_or(0.0)).max(0.0);
+            if available_cash < 1.0 {
+                if tick_count % 1000 == 0 {
+                    info!(
+                        "[System] Balance < $1.0, entering hibernation mode. Waiting for fills..."
+                    );
+                }
+                return;
+            }
         }
     }
 

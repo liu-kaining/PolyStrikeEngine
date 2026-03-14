@@ -7,7 +7,7 @@ use axum::{
     Json, Router,
 };
 use serde::Serialize;
-use tokio::sync::watch;
+use tokio::sync::{watch, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::api::{
@@ -21,6 +21,9 @@ use crate::models::types::BookTicker;
 use crate::risk::{InventoryManager, MarketExposure, RiskGuard};
 use tracing::{error, info};
 
+/// Shared handle to the current event slug (set by /event/start or auto-pilot).
+pub type CurrentEventSlug = Arc<RwLock<Option<String>>>;
+
 #[derive(Clone)]
 struct ApiState {
     inventory: Arc<InventoryManager>,
@@ -30,6 +33,7 @@ struct ApiState {
     binance_rx: watch::Receiver<BookTicker>,
     dry_run: bool,
     global_cancel: CancellationToken,
+    current_event_slug: CurrentEventSlug,
 }
 
 #[derive(Serialize)]
@@ -125,43 +129,38 @@ async fn strategy_stop_handler(
     }))
 }
 
-async fn event_start_handler(
-    State(state): State<ApiState>,
-    Json(req): Json<StartEventRadarReq>,
-) -> Result<Json<MessageResponse>, (StatusCode, Json<MessageResponse>)> {
-    let markets = radar::fetch_event_markets(&req.event_slug)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::BAD_GATEWAY,
-                Json(MessageResponse {
-                    message: format!("Failed to discover markets for slug {}: {}", req.event_slug, e),
-                }),
-            )
-        })?;
-
+/// Internal: start event radar for a slug (used by HTTP handler and auto-pilot).
+/// Returns number of markets started.
+pub async fn start_event_radar(
+    slug: &str,
+    snipe_size: f64,
+    volatility: f64,
+    dry_run: bool,
+    inventory: Arc<InventoryManager>,
+    risk_guard: Arc<RiskGuard>,
+    strategies: Arc<StrategyRegistry>,
+    poly_client: Option<Arc<PolyClient>>,
+    binance_rx: watch::Receiver<BookTicker>,
+    global_cancel: CancellationToken,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let markets = radar::fetch_event_markets(slug).await.map_err(|e| {
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
+        Box::new(io_err) as Box<dyn std::error::Error + Send + Sync>
+    })?;
     let mut started = 0usize;
-    let mut skipped = 0usize;
-
     for market in markets {
-        let Some(cancel_token) = state.strategies.try_register(market.token_id.clone()) else {
-            skipped += 1;
+        let Some(cancel_token) = strategies.try_register(market.token_id.clone()) else {
             continue;
         };
-
         let token_id = market.token_id;
         let strike_price = market.strike_price;
         let expiry_timestamp = market.expiry_timestamp;
-        let snipe_size = req.snipe_size;
-        let volatility = req.volatility;
-        let dry_run = state.dry_run;
-        let inventory = state.inventory.clone();
-        let risk_guard = state.risk_guard.clone();
-        let strategies = state.strategies.clone();
-        let poly_client = state.poly_client.clone();
-        let binance_rx = state.binance_rx.clone();
-        let child_cancel = state.global_cancel.child_token();
-
+        let inventory = inventory.clone();
+        let risk_guard = risk_guard.clone();
+        let strategies = strategies.clone();
+        let poly_client = poly_client.clone();
+        let binance_rx = binance_rx.clone();
+        let child_cancel = global_cancel.child_token();
         let combined_cancel = CancellationToken::new();
         let cc = combined_cancel.clone();
         let ct = cancel_token.clone();
@@ -172,21 +171,52 @@ async fn event_start_handler(
                 _ = gc.cancelled() => { cc.cancel(); }
             }
         });
-
         tokio::spawn(async move {
             engine::run_sniper_task(
                 token_id, strike_price, snipe_size, expiry_timestamp, volatility,
                 dry_run, inventory, risk_guard, poly_client, binance_rx,
                 combined_cancel, strategies,
-            ).await;
+            )
+            .await;
         });
         started += 1;
     }
+    Ok(started)
+}
 
+async fn event_start_handler(
+    State(state): State<ApiState>,
+    Json(req): Json<StartEventRadarReq>,
+) -> Result<Json<MessageResponse>, (StatusCode, Json<MessageResponse>)> {
+    let started = start_event_radar(
+        &req.event_slug,
+        req.snipe_size,
+        req.volatility,
+        state.dry_run,
+        state.inventory.clone(),
+        state.risk_guard.clone(),
+        state.strategies.clone(),
+        state.poly_client.clone(),
+        state.binance_rx.clone(),
+        state.global_cancel.clone(),
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(MessageResponse {
+                message: format!(
+                    "Failed to discover markets for slug {}: {}",
+                    req.event_slug, e
+                ),
+            }),
+        )
+    })?;
+    *state.current_event_slug.write().await = Some(req.event_slug.clone());
     Ok(Json(MessageResponse {
         message: format!(
-            "Event radar started for slug {}: {} markets launched ({} skipped).",
-            req.event_slug, started, skipped
+            "Event radar started for slug {}: {} markets launched.",
+            req.event_slug, started
         ),
     }))
 }
@@ -199,6 +229,7 @@ pub async fn start_api_server(
     binance_rx: watch::Receiver<BookTicker>,
     dry_run: bool,
     global_cancel: CancellationToken,
+    current_event_slug: CurrentEventSlug,
     port: u16,
 ) {
     let app_state = ApiState {
@@ -209,6 +240,7 @@ pub async fn start_api_server(
         binance_rx,
         dry_run,
         global_cancel,
+        current_event_slug,
     };
     let app = Router::new()
         .route("/status", get(status_handler))

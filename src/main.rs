@@ -11,12 +11,14 @@ mod strategy;
 use std::sync::Arc;
 use std::time::Duration;
 
+use api::server::{start_event_radar, CurrentEventSlug};
 use api::strategy_registry::StrategyRegistry;
 use config::AppConfig;
 use execution::poly_client::PolyClient;
 use models::btc_price;
 use oracle::binance_ws::spawn_binance_book_ticker_stream;
 use risk::{InventoryManager, RiskGuard};
+use rust_decimal::prelude::ToPrimitive;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info};
 use tracing_appender::rolling;
@@ -117,6 +119,9 @@ fn main() -> anyhow::Result<()> {
             }
         };
 
+        // -- Current event slug (set by /event/start or auto-pilot) --
+        let current_event_slug: CurrentEventSlug = Arc::new(tokio::sync::RwLock::new(None));
+
         // -- API server (carries singletons via ApiState) --
         let inventory_for_shutdown = inventory.clone();
         tokio::spawn(api::server::start_api_server(
@@ -127,8 +132,76 @@ fn main() -> anyhow::Result<()> {
             binance_rx.clone(),
             cfg.dry_run,
             global_cancel.clone(),
+            current_event_slug.clone(),
             3333,
         ));
+
+        // -- Auto-pilot: every 1h check for next day's battlefield and switch if event exists and cash recovered --
+        let ap_inventory = inventory.clone();
+        let ap_risk_guard = risk_guard.clone();
+        let ap_strategies = strategies.clone();
+        let ap_poly_client = poly_client.clone();
+        let ap_binance_rx = binance_rx.clone();
+        let ap_cancel = global_cancel.clone();
+        let ap_slug = current_event_slug.clone();
+        let ap_dry_run = cfg.dry_run;
+        const AUTO_PILOT_SNIPE_SIZE: f64 = 3.0;
+        const AUTO_PILOT_VOLATILITY: f64 = 0.80;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(3600));
+            interval.tick().await; // first tick fires immediately; skip it
+            loop {
+                interval.tick().await;
+                if ap_cancel.is_cancelled() {
+                    break;
+                }
+                let next_slug = discovery::predict_next_slug();
+                if !discovery::radar::check_event_exists(&next_slug)
+                    .await
+                    .unwrap_or(false)
+                {
+                    continue;
+                }
+                let current = ap_slug.read().await.clone();
+                if current.as_deref() == Some(next_slug.as_str()) {
+                    continue;
+                }
+                let max_budget = ap_risk_guard.max_budget_f64();
+                if max_budget <= 0.0 {
+                    continue;
+                }
+                let spent = ap_risk_guard.current_spent();
+                let available_cash = (max_budget - spent.to_f64().unwrap_or(0.0)).max(0.0);
+                if available_cash < 1.0 {
+                    continue;
+                }
+                match start_event_radar(
+                    &next_slug,
+                    AUTO_PILOT_SNIPE_SIZE,
+                    AUTO_PILOT_VOLATILITY,
+                    ap_dry_run,
+                    ap_inventory.clone(),
+                    ap_risk_guard.clone(),
+                    ap_strategies.clone(),
+                    ap_poly_client.clone(),
+                    ap_binance_rx.clone(),
+                    ap_cancel.child_token(),
+                )
+                .await
+                {
+                    Ok(_) => {
+                        *ap_slug.write().await = Some(next_slug.clone());
+                        info!(
+                            "[Auto-Pilot] 🚀 New battlefield detected: {}. Switching gears...",
+                            next_slug
+                        );
+                    }
+                    Err(e) => {
+                        error!("[Auto-Pilot] Failed to start event {}: {}", next_slug, e);
+                    }
+                }
+            }
+        });
 
         // -- 30s heartbeat --
         let heartbeat_binance_rx = binance_rx.clone();

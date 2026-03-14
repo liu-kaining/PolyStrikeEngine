@@ -145,3 +145,24 @@ pub async fn fetch_event_markets(slug: &str) -> Result<Vec<MarketInfo>, Box<dyn 
 
     Ok(out)
 }
+
+/// Checks if the Polymarket event for the given slug exists (API returns 200 with events).
+/// Returns Ok(false) on 404 or empty response so caller can retry later.
+pub async fn check_event_exists(slug: &str) -> Result<bool, Box<dyn Error>> {
+    let url = format!("https://gamma-api.polymarket.com/events?slug={slug}");
+    let resp = get_client().get(&url).send().await?;
+    let status = resp.status();
+    if status == reqwest::StatusCode::NOT_FOUND {
+        return Ok(false);
+    }
+    if status == reqwest::StatusCode::FORBIDDEN {
+        warn!(
+            "[Radar] Gamma API 403 for slug '{}', treating as unavailable.",
+            slug
+        );
+        return Ok(false);
+    }
+    let payload: Value = resp.error_for_status()?.json().await?;
+    let events = payload.as_array().ok_or("gamma events response is not an array")?;
+    Ok(!events.is_empty())
+}
