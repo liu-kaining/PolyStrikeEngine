@@ -146,6 +146,114 @@ pub async fn fetch_event_markets(slug: &str) -> Result<Vec<MarketInfo>, Box<dyn 
     Ok(out)
 }
 
+/// Parses expiry timestamp from slug (e.g. "btc-updown-5m-1734567890" -> 1734567890).
+/// Returns None if slug does not end with a unix timestamp.
+fn parse_expiry_from_slug(slug: &str) -> Option<i64> {
+    let last = slug.rsplit('-').next()?;
+    if last.len() == 10 && last.bytes().all(|b| b.is_ascii_digit()) {
+        return last.parse::<i64>().ok();
+    }
+    None
+}
+
+/// Fetches one page of events from Gamma (no slug filter). Used by 5m radar.
+async fn fetch_events_page(limit: u32, offset: u32) -> Result<Vec<Value>, Box<dyn Error>> {
+    let url = "https://gamma-api.polymarket.com/events";
+    let limit_s = limit.to_string();
+    let offset_s = offset.to_string();
+    let resp = get_client()
+        .get(url)
+        .query(&[
+            ("limit", limit_s.as_str()),
+            ("offset", offset_s.as_str()),
+            ("active", "true"),
+        ])
+        .send()
+        .await?;
+    if resp.status() == reqwest::StatusCode::FORBIDDEN {
+        return Err("Gamma API 403".into());
+    }
+    let payload: Value = resp.error_for_status()?.json().await?;
+    let events = payload.as_array().ok_or("gamma events response is not an array")?;
+    Ok(events.clone())
+}
+
+/// 5 分钟高频雷达：拉取包含 "updown-5m" 的活跃事件，只保留 1～3 分钟内到期的市场。
+/// 供外部每 1 分钟定时调用（如 interval tick）。
+pub async fn fetch_updown_5m_markets_near_expiry() -> Result<Vec<MarketInfo>, Box<dyn Error>> {
+    let now = chrono::Utc::now().timestamp();
+    let min_expiry = now + 60;   // 至少 1 分钟后到期
+    let max_expiry = now + 180;  // 最多 3 分钟后到期
+
+    let mut out = Vec::new();
+    let limit = 100u32;
+    let mut offset = 0u32;
+
+    loop {
+        let events = fetch_events_page(limit, offset).await?;
+        if events.is_empty() {
+            break;
+        }
+        for event in &events {
+            let slug = event.get("slug").and_then(|v| v.as_str()).unwrap_or("");
+            if !slug.contains("updown-5m") {
+                continue;
+            }
+            let expiry_ts = parse_expiry_from_slug(slug)
+                .or_else(|| {
+                    event
+                        .get("endDate")
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .map(|dt| dt.timestamp())
+                });
+            let Some(exp) = expiry_ts else { continue };
+            if exp < min_expiry || exp > max_expiry {
+                continue;
+            }
+            let Some(markets) = event.get("markets").and_then(|m| m.as_array()) else {
+                continue;
+            };
+            for market in markets {
+                let active = market.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+                let closed = market.get("closed").and_then(|v| v.as_bool()).unwrap_or(true);
+                if !active || closed {
+                    continue;
+                }
+                let Some(token_id) = extract_yes_token_id(market) else {
+                    continue;
+                };
+                let strike_price = parse_f64_field(market.get("line")).or_else(|| {
+                    market
+                        .get("groupItemTitle")
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_number_from_text)
+                });
+                let Some(mut strike_price) = strike_price else {
+                    continue;
+                };
+                if strike_price < 1000.0 && strike_price > 10.0 {
+                    strike_price *= 1000.0;
+                }
+                let Some(end_date) = market.get("endDate").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let expiry_timestamp = DateTime::parse_from_rfc3339(end_date)?.timestamp();
+                out.push(MarketInfo {
+                    token_id,
+                    strike_price,
+                    expiry_timestamp,
+                });
+            }
+        }
+        if (events.len() as u32) < limit {
+            break;
+        }
+        offset += limit;
+    }
+    Ok(out)
+}
+
 /// Checks if the Polymarket event for the given slug exists (API returns 200 with events).
 /// Returns Ok(false) on 404 or empty response so caller can retry later.
 pub async fn check_event_exists(slug: &str) -> Result<bool, Box<dyn Error>> {

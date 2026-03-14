@@ -55,6 +55,7 @@ impl SniperStrategy {
 
     /// Black-Scholes-style fair probability for a European digital call (binary YES option).
     /// Uses a cached N(0,1) distribution — zero allocation on the hot path.
+    /// Clamps very small time_to_expiry (e.g. 60s = ~1.9e-6 years) to avoid sqrt(0) and NaN.
     pub(crate) fn calculate_binary_call_price(
         spot: f64,
         strike: f64,
@@ -67,8 +68,10 @@ impl SniperStrategy {
         if time_to_expiry_years <= 0.0 {
             return if spot >= strike { 1.0 } else { 0.0 };
         }
-        let d2 = ((spot / strike).ln() - (volatility * volatility / 2.0) * time_to_expiry_years)
-            / (volatility * time_to_expiry_years.sqrt());
+        // 极小剩余期限（如 60 秒）时 sqrt 下溢会导致 d2 异常，下限 1e-10 年约 3 秒
+        let t = time_to_expiry_years.max(1e-10);
+        let d2 = ((spot / strike).ln() - (volatility * volatility / 2.0) * t)
+            / (volatility * t.sqrt());
         std_normal().cdf(d2)
     }
 }

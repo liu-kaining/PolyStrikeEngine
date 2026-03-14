@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
+use futures_util::future::join_all;
 use rust_decimal::prelude::ToPrimitive;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
@@ -23,6 +24,11 @@ const ORDER_TIMEOUT_SECS_DEFAULT: u64 = 5;
 const PENDING_WATCHDOG_SECS_DEFAULT: u64 = 8;
 const ORDER_FAIL_COOLDOWN_SECS_DEFAULT: u64 = 2;
 const EDGE_MONITOR_INTERVAL_DEFAULT: u64 = 5000;
+/// 超过此金额（USD）的买单拆成多笔小单（冰山委托）
+const ICEBERG_THRESHOLD_USD: f64 = 5.0;
+const ICEBERG_CHUNK_MIN_USD: f64 = 3.0;
+const ICEBERG_CHUNK_MAX_USD: f64 = 5.0;
+const ICEBERG_WINDOW_SECS: u64 = 1;
 
 fn env_f64(name: &str, default: f64) -> f64 {
     std::env::var(name)
@@ -64,6 +70,39 @@ fn order_fail_cooldown_secs() -> u64 {
 
 fn edge_monitor_interval() -> u64 {
     env_u64("EDGE_MONITOR_INTERVAL", EDGE_MONITOR_INTERVAL_DEFAULT)
+}
+
+/// 将总 size 按 $3～$5 一档拆成多笔（冰山委托），返回每笔的 size。
+fn iceberg_chunk_sizes(total_size: f64, price: f64) -> Vec<f64> {
+    if price <= 0.0 || total_size <= 0.0 {
+        return vec![];
+    }
+    let total_usd = total_size * price;
+    if total_usd <= ICEBERG_THRESHOLD_USD {
+        return vec![total_size];
+    }
+    let n = (total_usd / ICEBERG_CHUNK_MAX_USD).ceil() as usize;
+    let n = n.max(1);
+    let chunk_usd = total_usd / (n as f64);
+    let n = if chunk_usd < ICEBERG_CHUNK_MIN_USD {
+        (total_usd / ICEBERG_CHUNK_MIN_USD).ceil() as usize
+    } else {
+        n
+    };
+    let n = n.max(1);
+    let chunk_size = total_size / (n as f64);
+    let mut sizes = vec![chunk_size; n];
+    // 最后一块微调以保证 sum = total_size
+    let sum: f64 = sizes.iter().sum();
+    if let Some(last) = sizes.last_mut() {
+        *last += total_size - sum;
+    }
+    sizes.retain(|s| *s > 0.0);
+    if sizes.is_empty() {
+        vec![total_size]
+    } else {
+        sizes
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -635,50 +674,93 @@ async fn try_fire(
         .await
         .unwrap_or_else(|_| inv.get_net_exposure(token_id_clone.as_str()).max(0.0));
 
-    // Only put a hard timeout around the RPC to place the order.
-    // Subsequent on-chain confirmation + position sync are allowed to take longer
-    // without being treated as a hard failure, to avoid "false timeout" warnings.
-    let place_result = tokio::time::timeout(
-        Duration::from_secs(order_timeout_secs()),
-        client.execute_snipe_order(
-            token_id_clone.as_str(),
-            signal.side,
-            signal.target_price,
-            signal.size,
-        ),
-    )
-    .await;
-
-    let order_id = match place_result {
-        Ok(Ok(id)) => id,
-        Ok(Err(e)) => {
-            error!("[FIRE][K={:.0}] Order failed: {:#?}, releasing budget", strike_price, e);
-            if let Some(ref res) = reservation {
-                risk_guard.release_budget(res.as_ref().clone_for_release());
+    let total_usd = signal.size * signal.target_price;
+    let iceberg = signal.side == OrderSide::Buy && total_usd > ICEBERG_THRESHOLD_USD;
+    let place_ok = if iceberg {
+        let chunks = iceberg_chunk_sizes(signal.size, signal.target_price);
+        let futures: Vec<_> = chunks
+            .into_iter()
+            .map(|sz| {
+                let c = client.clone();
+                let t = token_id_clone.clone();
+                async move {
+                    c.execute_snipe_order(&t, signal.side, signal.target_price, sz)
+                        .await
+                }
+            })
+            .collect();
+        match tokio::time::timeout(
+            Duration::from_secs(ICEBERG_WINDOW_SECS),
+            join_all(futures),
+        )
+        .await
+        {
+            Ok(results) => {
+                let ok_count = results.iter().filter(|r| r.is_ok()).count();
+                let err_count = results.len() - ok_count;
+                if err_count > 0 {
+                    debug!(
+                        "[FIRE][K={:.0}] Iceberg: {} ok, {} failed",
+                        strike_price, ok_count, err_count
+                    );
+                }
+                ok_count > 0
             }
-            if matches!(signal.side, OrderSide::Buy) {
-                risk_guard.release_global_buy_slot();
+            Err(_) => {
+                warn!(
+                    "[HFT-WARN] ⚠️ 冰山委托在 {}s 内未全部返回。 K={:.0}",
+                    ICEBERG_WINDOW_SECS, strike_price
+                );
+                false
             }
-            let _ = fill_tx.send(fail_update(None)).await;
-            return;
         }
-        Err(_) => {
-            warn!(
-                "[HFT-WARN] ⚠️ execute_snipe_order 在 {}s 内未返回，状态机将回滚。 side={:?}, K={:.0}",
-                order_timeout_secs(), signal.side, strike_price
-            );
-            if let Some(ref res) = reservation {
-                risk_guard.release_budget(res.as_ref().clone_for_release());
+    } else {
+        match tokio::time::timeout(
+            Duration::from_secs(order_timeout_secs()),
+            client.execute_snipe_order(
+                token_id_clone.as_str(),
+                signal.side,
+                signal.target_price,
+                signal.size,
+            ),
+        )
+        .await
+        {
+            Ok(Ok(_)) => true,
+            Ok(Err(e)) => {
+                error!(
+                    "[FIRE][K={:.0}] Order failed: {:#?}, releasing budget",
+                    strike_price, e
+                );
+                false
             }
-            if matches!(signal.side, OrderSide::Buy) {
-                risk_guard.release_global_buy_slot();
+            Err(_) => {
+                warn!(
+                    "[HFT-WARN] ⚠️ execute_snipe_order 在 {}s 内未返回。 side={:?}, K={:.0}",
+                    order_timeout_secs(),
+                    signal.side,
+                    strike_price
+                );
+                false
             }
-            let _ = fill_tx.send(fail_update(None)).await;
-            return;
         }
     };
 
-    info!("[FIRE][K={:.0}] Order placed: {}", strike_price, order_id);
+    if !place_ok {
+        if let Some(ref res) = reservation {
+            risk_guard.release_budget(res.as_ref().clone_for_release());
+        }
+        if matches!(signal.side, OrderSide::Buy) {
+            risk_guard.release_global_buy_slot();
+        }
+        let _ = fill_tx.send(fail_update(None)).await;
+        return;
+    }
+
+    info!(
+        "[FIRE][K={:.0}] Order(s) placed (iceberg={})",
+        strike_price, iceberg
+    );
 
     // High-frequency mode: wait briefly for a fill snapshot. If position
     // hasn't changed after ~1.5s, treat as no-fill and free the global BUY slot.

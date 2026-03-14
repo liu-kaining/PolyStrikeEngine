@@ -54,6 +54,17 @@ impl StrategyRegistry {
         }
     }
 
+    /// Cancel all registered strategies (e.g. before auto-rotation to a new 5m market). Returns count cancelled.
+    pub fn cancel_all(&self) -> usize {
+        let mut n = 0;
+        self.cancel_tokens.retain(|_, token| {
+            token.cancel();
+            n += 1;
+            false
+        });
+        n
+    }
+
     /// Remove entry for `token_id` without cancelling. Call when the engine task exits on its own
     /// (e.g. WS stream error) to avoid zombie registry entries.
     pub fn deregister(&self, token_id: &str) {
