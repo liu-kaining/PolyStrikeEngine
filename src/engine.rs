@@ -161,6 +161,7 @@ pub async fn run_sniper_task(
     volatility: f64,
     is_relative_strike: bool,
     strike_timestamp: Option<i64>,
+    basis_adjustment: f64,
     dry_run: bool,
     inventory: Arc<InventoryManager>,
     risk_guard: Arc<RiskGuard>,
@@ -218,7 +219,17 @@ pub async fn run_sniper_task(
     } else {
         String::new()
     };
-    info!("[Engine] 🎯 Monitoring K={:.0}{}", strike_price, relative_tag);
+    if basis_adjustment != 0.0 {
+        info!(
+            "[Engine] 🎯 Monitoring K={:.0} (Binance {:.0} + Adjustment {:.1}){}",
+            strike_price,
+            strike_price - basis_adjustment,
+            basis_adjustment,
+            relative_tag
+        );
+    } else {
+        info!("[Engine] 🎯 Monitoring K={:.0}{}", strike_price, relative_tag);
+    }
 
     loop {
         tokio::select! {

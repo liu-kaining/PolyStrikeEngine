@@ -11,6 +11,14 @@ use crate::models::btc_price;
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
+/// Chainlink 与 Binance 的基差校准：final_strike = binance_strike + BASIS_ADJUSTMENT（默认 0）。
+fn basis_adjustment() -> f64 {
+    std::env::var("BASIS_ADJUSTMENT")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
 #[derive(Debug, Clone)]
 pub struct MarketInfo {
     pub token_id: String,
@@ -20,6 +28,8 @@ pub struct MarketInfo {
     pub is_relative_strike: bool,
     /// 当 is_relative_strike 时，用于取整点价格的 target_timestamp（便于日志显示 16:10:00）
     pub strike_timestamp: Option<i64>,
+    /// 已加上的基差校准值（Chainlink - Binance），用于日志显示
+    pub basis_adjustment: f64,
 }
 
 static RADAR_CLIENT: OnceLock<Client> = OnceLock::new();
@@ -212,13 +222,31 @@ pub async fn fetch_event_markets(slug: &str) -> Result<Vec<MarketInfo>, Box<dyn 
                         .and_then(parse_strike_from_description)
                 });
             let target_ts = parse_expiry_from_slug(slug);
-            let mut strike_price = strike_from_api.unwrap_or_else(|| {
-                target_ts
-                    .and_then(btc_price::get_btc_at_timestamp)
-                    .unwrap_or_else(btc_price::get_btc_mid)
-            });
+            let mut strike_price = if let Some(s) = strike_from_api {
+                s
+            } else {
+                let from_cache = target_ts.and_then(btc_price::get_btc_at_timestamp);
+                if let Some(p) = from_cache {
+                    p
+                } else if let Some(ts) = target_ts {
+                    btc_price::fetch_historic_price_from_binance(ts)
+                        .await
+                        .unwrap_or_else(btc_price::get_btc_mid)
+                } else {
+                    btc_price::get_btc_mid()
+                }
+            };
             if strike_price < 1000.0 && strike_price > 10.0 {
                 strike_price *= 1000.0;
+            }
+            let adj = basis_adjustment();
+            strike_price += adj;
+            if strike_price <= 0.0 {
+                warn!(
+                    "[Radar] Strike price is 0, skipping market to prevent false triggers. token_id={}",
+                    token_id
+                );
+                continue;
             }
             let is_relative_strike = strike_from_api.is_none();
             let strike_timestamp = if is_relative_strike { target_ts } else { None };
@@ -234,6 +262,7 @@ pub async fn fetch_event_markets(slug: &str) -> Result<Vec<MarketInfo>, Box<dyn 
                 expiry_timestamp,
                 is_relative_strike,
                 strike_timestamp,
+                basis_adjustment: adj,
             });
         }
     }
@@ -243,8 +272,7 @@ pub async fn fetch_event_markets(slug: &str) -> Result<Vec<MarketInfo>, Box<dyn 
 
 /// Parses expiry timestamp from slug (e.g. "btc-updown-5m-1734567890" -> 1734567890).
 /// Returns None if slug does not end with a unix timestamp.
-#[allow(dead_code)]
-fn parse_expiry_from_slug(slug: &str) -> Option<i64> {
+pub fn parse_expiry_from_slug(slug: &str) -> Option<i64> {
     let last = slug.rsplit('-').next()?;
     if last.len() == 10 && last.bytes().all(|b| b.is_ascii_digit()) {
         return last.parse::<i64>().ok();
@@ -356,12 +384,14 @@ pub async fn fetch_updown_5m_markets_near_expiry() -> Result<Vec<MarketInfo>, Bo
                     continue;
                 };
                 let expiry_timestamp = DateTime::parse_from_rfc3339(end_date)?.timestamp();
+                let adj = basis_adjustment();
                 out.push(MarketInfo {
                     token_id,
-                    strike_price,
+                    strike_price: strike_price + adj,
                     expiry_timestamp,
                     is_relative_strike: false,
                     strike_timestamp: None,
+                    basis_adjustment: adj,
                 });
             }
         }

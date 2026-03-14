@@ -105,6 +105,7 @@ async fn strategy_start_handler(
             token_id, strike_price, snipe_size, expiry_timestamp, volatility,
             false,
             None,
+            0.0,
             dry_run, inventory, risk_guard, poly_client, binance_rx,
             combined_cancel, strategies,
         ).await;
@@ -145,6 +146,10 @@ pub async fn start_event_radar(
     binance_rx: watch::Receiver<BookTicker>,
     global_cancel: CancellationToken,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let anchor_ts = radar::parse_expiry_from_slug(slug)
+        .unwrap_or_else(|| chrono::Utc::now().timestamp());
+    crate::models::btc_price::warmup_btc_cache_for_past_15_min(anchor_ts).await;
+
     let markets = radar::fetch_event_markets(slug).await.map_err(|e| {
         let io_err = std::io::Error::new(std::io::ErrorKind::Other, e.to_string());
         Box::new(io_err) as Box<dyn std::error::Error + Send + Sync>
@@ -159,6 +164,7 @@ pub async fn start_event_radar(
         let expiry_timestamp = market.expiry_timestamp;
         let is_relative_strike = market.is_relative_strike;
         let strike_timestamp = market.strike_timestamp;
+        let basis_adjustment = market.basis_adjustment;
         let inventory = inventory.clone();
         let risk_guard = risk_guard.clone();
         let strategies = strategies.clone();
@@ -178,7 +184,7 @@ pub async fn start_event_radar(
         tokio::spawn(async move {
             engine::run_sniper_task(
                 token_id, strike_price, snipe_size, expiry_timestamp, volatility,
-                is_relative_strike, strike_timestamp,
+                is_relative_strike, strike_timestamp, basis_adjustment,
                 dry_run, inventory, risk_guard, poly_client, binance_rx,
                 combined_cancel, strategies,
             )
