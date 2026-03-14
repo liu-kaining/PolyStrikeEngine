@@ -24,6 +24,10 @@ const ORDER_TIMEOUT_SECS_DEFAULT: u64 = 5;
 const PENDING_WATCHDOG_SECS_DEFAULT: u64 = 8;
 const ORDER_FAIL_COOLDOWN_SECS_DEFAULT: u64 = 2;
 const EDGE_MONITOR_INTERVAL_DEFAULT: u64 = 5000;
+/// 买价硬上限：超过此价格绝不开枪，防止高位接盘（可 ENV MAX_BUY_PRICE 覆盖，默认 0.90）
+const MAX_BUY_PRICE_DEFAULT: f64 = 0.90;
+/// 相对价/开盘价盘口的基准价差保护：在此类市场上自动提高 ENTER_THRESHOLD（默认 +0.001）
+const RELATIVE_MARKET_OFFSET_THRESHOLD_DEFAULT: f64 = 0.001;
 /// 超过此金额（USD）的买单拆成多笔小单（冰山委托）
 const ICEBERG_THRESHOLD_USD: f64 = 5.0;
 const ICEBERG_CHUNK_MIN_USD: f64 = 3.0;
@@ -70,6 +74,14 @@ fn order_fail_cooldown_secs() -> u64 {
 
 fn edge_monitor_interval() -> u64 {
     env_u64("EDGE_MONITOR_INTERVAL", EDGE_MONITOR_INTERVAL_DEFAULT)
+}
+
+fn max_buy_price() -> f64 {
+    env_f64("MAX_BUY_PRICE", MAX_BUY_PRICE_DEFAULT)
+}
+
+fn relative_market_offset_threshold() -> f64 {
+    env_f64("RELATIVE_MARKET_OFFSET_THRESHOLD", RELATIVE_MARKET_OFFSET_THRESHOLD_DEFAULT)
 }
 
 /// 将总 size 按 $3～$5 一档拆成多笔（冰山委托），返回每笔的 size。
@@ -147,6 +159,8 @@ pub async fn run_sniper_task(
     snipe_size: f64,
     expiry_timestamp: i64,
     volatility: f64,
+    is_relative_strike: bool,
+    strike_timestamp: Option<i64>,
     dry_run: bool,
     inventory: Arc<InventoryManager>,
     risk_guard: Arc<RiskGuard>,
@@ -196,7 +210,15 @@ pub async fn run_sniper_task(
     let mut last_order_fail: Option<Instant> = None;
     let mut tick_count: u64 = 0;
 
-    info!("[Engine] 🎯 Monitoring K={:.0}", strike_price);
+    let relative_tag = if is_relative_strike {
+        strike_timestamp
+            .and_then(|ts| chrono::DateTime::from_timestamp(ts, 0))
+            .map(|dt| format!(" [Relative Strike from {}]", dt.format("%H:%M:%S")))
+            .unwrap_or_else(|| " [Relative Strike]".to_string())
+    } else {
+        String::new()
+    };
+    info!("[Engine] 🎯 Monitoring K={:.0}{}", strike_price, relative_tag);
 
     loop {
         tokio::select! {
@@ -328,7 +350,7 @@ pub async fn run_sniper_task(
                 evaluate_and_act(
                     &mut state, &sniper_strategy, binance_mid,
                     poly_book.best_ask, poly_book.best_bid,
-                    current_position, strike_price, dry_run,
+                    current_position, strike_price, is_relative_strike, dry_run,
                     &token_id, &risk_guard, &inventory, &poly_client, &fill_tx,
                     &last_order_fail, tick_count,
                 ).await;
@@ -348,12 +370,21 @@ pub async fn run_sniper_task(
                 evaluate_and_act(
                     &mut state, &sniper_strategy, binance_mid,
                     poly_book.best_ask, poly_book.best_bid,
-                    current_position, strike_price, dry_run,
+                    current_position, strike_price, is_relative_strike, dry_run,
                     &token_id, &risk_guard, &inventory, &poly_client, &fill_tx,
                     &last_order_fail, tick_count,
                 ).await;
             }
         }
+    }
+}
+
+fn enter_threshold_effective(is_relative_strike: bool) -> f64 {
+    let base = enter_threshold();
+    if is_relative_strike {
+        base + relative_market_offset_threshold()
+    } else {
+        base
     }
 }
 
@@ -366,6 +397,7 @@ async fn evaluate_and_act(
     best_bid: f64,
     current_position: f64,
     strike_price: f64,
+    is_relative_strike: bool,
     dry_run: bool,
     token_id: &str,
     risk_guard: &Arc<RiskGuard>,
@@ -418,9 +450,10 @@ async fn evaluate_and_act(
             PositionState::Holding { .. } => "HOLD",
             PositionState::PendingSell { .. } => "P-SELL",
         };
+        let thr = enter_threshold_effective(is_relative_strike);
         info!(
             "[Monitor] K={:.0} | FV:{:.4} Ask:{:.3} Bid:{:.3} | BuyEdge:{:.4} SellEdge:{:.4} | Thr:{:.3} | State:{} | BTC:{:.1}",
-            strike_price, fair_value, best_ask, best_bid, buy_edge, sell_edge, enter_threshold(), state_tag, binance_mid,
+            strike_price, fair_value, best_ask, best_bid, buy_edge, sell_edge, thr, state_tag, binance_mid,
         );
     }
 
@@ -433,7 +466,17 @@ async fn evaluate_and_act(
                 return;
             }
 
-            if best_ask > 0.0 && buy_edge > enter_threshold() {
+            let thr_eff = enter_threshold_effective(is_relative_strike);
+            if best_ask > 0.0 && buy_edge > thr_eff {
+                if best_ask > max_buy_price() {
+                    if tick_count % edge_monitor_interval() == 0 {
+                        debug!(
+                            "[Skipped] K={:.0} | Reason: ask {:.3} > MAX_BUY_PRICE {:.2}",
+                            strike_price, best_ask, max_buy_price(),
+                        );
+                    }
+                    return;
+                }
                 // Interpret snipe_size as USD budget per shot.
                 let budget_per_trade = sniper_strategy.snipe_size;
                 let shares_to_buy = (budget_per_trade / best_ask).floor();
@@ -487,6 +530,17 @@ async fn evaluate_and_act(
                     }
                     return;
                 }
+                // 同一 token 只允许 1 个活跃订单：已有 Pending 则不再 spawn
+                if !risk_guard.try_acquire_token_buy_slot(token_id) {
+                    risk_guard.release_global_buy_slot();
+                    if tick_count % edge_monitor_interval() == 0 {
+                        debug!(
+                            "[Skipped] K={:.0} | Reason: token already has PendingBuy",
+                            strike_price
+                        );
+                    }
+                    return;
+                }
 
                 // Check that the USD budget per shot fits inside remaining global budget.
                 if !risk_guard.can_afford(1.0, sniper_strategy.snipe_size) {
@@ -506,7 +560,7 @@ async fn evaluate_and_act(
                 }
                 info!(
                     "[TRIGGER] K={:.0} | Edge:{:.4} > Thr:{:.3} | Ask:{:.3} FV:{:.4} | Spawning order...",
-                    strike_price, buy_edge, enter_threshold(), best_ask, fair_value,
+                    strike_price, buy_edge, thr_eff, best_ask, fair_value,
                 );
                 let signal = crate::strategy::SnipeSignal {
                     side: OrderSide::Buy,
@@ -627,6 +681,7 @@ async fn try_fire(
                 debug!("[RiskGuard] ⛔ Budget rejected (race): {}", e);
                 if matches!(signal.side, OrderSide::Buy) {
                     risk_guard.release_global_buy_slot();
+                    risk_guard.release_token_buy_slot(&token_id);
                 }
                 let _ = fill_tx.send(fail_update(None)).await;
                 return;
@@ -646,6 +701,7 @@ async fn try_fire(
         }
         if matches!(signal.side, OrderSide::Buy) {
             risk_guard.release_global_buy_slot();
+            risk_guard.release_token_buy_slot(&token_id);
         }
         let _ = fill_tx.send(fail_update(None)).await;
         return;
@@ -660,6 +716,7 @@ async fn try_fire(
         }
         if matches!(signal.side, OrderSide::Buy) {
             risk_guard.release_global_buy_slot();
+            risk_guard.release_token_buy_slot(&token_id);
         }
         let _ = fill_tx.send(fail_update(None)).await;
         return;
@@ -752,6 +809,7 @@ async fn try_fire(
         }
         if matches!(signal.side, OrderSide::Buy) {
             risk_guard.release_global_buy_slot();
+            risk_guard.release_token_buy_slot(&token_id);
         }
         let _ = fill_tx.send(fail_update(None)).await;
         return;
@@ -786,6 +844,7 @@ async fn try_fire(
         }
         if matches!(signal.side, OrderSide::Buy) {
             risk_guard.release_global_buy_slot();
+            risk_guard.release_token_buy_slot(&token_id);
         }
         let _ = fill_tx.send(ExecutedOrderUpdate {
             side: signal.side,
@@ -825,5 +884,6 @@ async fn try_fire(
         .await;
     if matches!(signal.side, OrderSide::Buy) {
         risk_guard.release_global_buy_slot();
+        risk_guard.release_token_buy_slot(&token_id);
     }
 }

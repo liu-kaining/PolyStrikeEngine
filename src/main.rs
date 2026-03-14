@@ -135,7 +135,7 @@ fn main() -> anyhow::Result<()> {
             3333,
         ));
 
-        // -- 高频战术雷达：每 10 秒用 5 分钟 slug 推算并自动换弹（先清旧 sniper 再挂新盘）--
+        // -- 终极版 5 分钟雷达：硬算 slug（当前 5m 整点），每 10 秒轮询，确认存活后 start_event_radar --
         let ap_inventory = inventory.clone();
         let ap_risk_guard = risk_guard.clone();
         let ap_strategies = strategies.clone();
@@ -160,12 +160,12 @@ fn main() -> anyhow::Result<()> {
                 if ap_cancel.is_cancelled() {
                     break;
                 }
-                let next_slug = discovery::predict_current_5m_slug();
+                let target_slug = discovery::predict_current_5m_slug();
                 let current = ap_slug.read().await.clone();
-                if current.as_deref() == Some(next_slug.as_str()) {
+                if current.as_deref() == Some(target_slug.as_str()) {
                     continue;
                 }
-                if !discovery::radar::check_event_exists(&next_slug)
+                if !discovery::radar::check_event_exists(&target_slug)
                     .await
                     .unwrap_or(false)
                 {
@@ -176,7 +176,7 @@ fn main() -> anyhow::Result<()> {
                     info!("[Auto-Reload] Stopped {} previous sniper(s) before rotation.", cancelled);
                 }
                 match start_event_radar(
-                    &next_slug,
+                    &target_slug,
                     snipe_size,
                     volatility,
                     ap_dry_run,
@@ -190,14 +190,14 @@ fn main() -> anyhow::Result<()> {
                 .await
                 {
                     Ok(_) => {
-                        *ap_slug.write().await = Some(next_slug.clone());
+                        *ap_slug.write().await = Some(target_slug.clone());
                         info!(
-                            "[Auto-Reload] 🔄 5-min market rotated! Locking on target: {}",
-                            next_slug
+                            "[Auto-Reload] 🔄 5-min market rotated! Target: {}",
+                            target_slug
                         );
                     }
                     Err(e) => {
-                        error!("[Auto-Reload] Failed to start event {}: {}", next_slug, e);
+                        error!("[Auto-Reload] Failed to start event {}: {}", target_slug, e);
                     }
                 }
             }

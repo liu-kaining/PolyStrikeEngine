@@ -6,6 +6,7 @@
 use std::sync::RwLock;
 use std::sync::atomic::{AtomicU8, Ordering};
 
+use dashmap::DashSet;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 
@@ -24,6 +25,8 @@ pub struct RiskGuard {
     frozen: RwLock<bool>,
     /// Number of BUY orders currently in-flight. Max 2 for small accounts to double fire rate.
     pending_buy_count: AtomicU8,
+    /// Token IDs that currently have a PendingBuy (one active order per token).
+    token_pending_buy: DashSet<String>,
 }
 
 const MAX_CONCURRENT_BUYS_DEFAULT: u8 = 2;
@@ -45,6 +48,7 @@ impl RiskGuard {
             max_exposure_per_market: Decimal::ZERO,
             frozen: RwLock::new(false),
             pending_buy_count: AtomicU8::new(0),
+            token_pending_buy: DashSet::new(),
         }
     }
 
@@ -197,6 +201,16 @@ impl RiskGuard {
     /// Release a BUY slot when order completes (success or fail).
     pub fn release_global_buy_slot(&self) {
         self.pending_buy_count.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Try to acquire a per-token BUY slot. Returns false if this token already has a pending buy.
+    pub fn try_acquire_token_buy_slot(&self, token_id: &str) -> bool {
+        self.token_pending_buy.insert(token_id.to_string())
+    }
+
+    /// Release the per-token BUY slot when order completes or times out.
+    pub fn release_token_buy_slot(&self, token_id: &str) {
+        self.token_pending_buy.remove(token_id);
     }
 
     /// Read-only check for diagnostics.

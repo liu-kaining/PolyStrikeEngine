@@ -103,6 +103,8 @@ async fn strategy_start_handler(
     tokio::spawn(async move {
         engine::run_sniper_task(
             token_id, strike_price, snipe_size, expiry_timestamp, volatility,
+            false,
+            None,
             dry_run, inventory, risk_guard, poly_client, binance_rx,
             combined_cancel, strategies,
         ).await;
@@ -155,6 +157,8 @@ pub async fn start_event_radar(
         let token_id = market.token_id;
         let strike_price = market.strike_price;
         let expiry_timestamp = market.expiry_timestamp;
+        let is_relative_strike = market.is_relative_strike;
+        let strike_timestamp = market.strike_timestamp;
         let inventory = inventory.clone();
         let risk_guard = risk_guard.clone();
         let strategies = strategies.clone();
@@ -174,6 +178,7 @@ pub async fn start_event_radar(
         tokio::spawn(async move {
             engine::run_sniper_task(
                 token_id, strike_price, snipe_size, expiry_timestamp, volatility,
+                is_relative_strike, strike_timestamp,
                 dry_run, inventory, risk_guard, poly_client, binance_rx,
                 combined_cancel, strategies,
             )

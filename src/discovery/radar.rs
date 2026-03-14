@@ -4,7 +4,9 @@ use std::sync::OnceLock;
 use chrono::DateTime;
 use reqwest::Client;
 use serde_json::Value;
-use tracing::warn;
+use tracing::{info, warn};
+
+use crate::models::btc_price;
 
 const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) \
     AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
@@ -14,6 +16,10 @@ pub struct MarketInfo {
     pub token_id: String,
     pub strike_price: f64,
     pub expiry_timestamp: i64,
+    /// 是否由“开盘价”补位得到的 strike（相对价盘口）
+    pub is_relative_strike: bool,
+    /// 当 is_relative_strike 时，用于取整点价格的 target_timestamp（便于日志显示 16:10:00）
+    pub strike_timestamp: Option<i64>,
 }
 
 static RADAR_CLIENT: OnceLock<Client> = OnceLock::new();
@@ -44,10 +50,12 @@ fn parse_f64_field(v: Option<&Value>) -> Option<f64> {
     v.as_str()?.parse::<f64>().ok()
 }
 
+/// 提取数字（忽略逗号），用于 groupItemTitle 等。先去掉逗号再解析。
 fn parse_number_from_text(text: &str) -> Option<f64> {
+    let normalized = text.replace(',', "");
     let mut started = false;
     let mut buf = String::new();
-    for ch in text.chars() {
+    for ch in normalized.chars() {
         if ch.is_ascii_digit() || ch == '.' || (ch == '-' && !started) {
             started = true;
             buf.push(ch);
@@ -61,18 +69,85 @@ fn parse_number_from_text(text: &str) -> Option<f64> {
     buf.parse::<f64>().ok()
 }
 
-fn extract_yes_token_id(v: &Value) -> Option<String> {
-    if let Some(arr) = v.get("clobTokenIds").and_then(|x| x.as_array()) {
-        return arr.first()?.as_str().map(|s| s.to_string());
+/// 从 5 分钟市场描述中提取 strike：e.g. "Will the price of Bitcoin be above $70,540.2 at 11:35 AM ET?"
+/// 先去掉逗号再匹配 $ 后的数字。
+fn parse_strike_from_description(description: &str) -> Option<f64> {
+    let normalized = description.replace(',', "");
+    let after_dollar = normalized.split('$').nth(1)?;
+    let num_str: String = after_dollar
+        .chars()
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    if num_str.is_empty() {
+        return None;
     }
+    num_str.parse::<f64>().ok()
+}
 
-    let raw = v.get("clobTokenIds").and_then(|x| x.as_str())?;
-    let parsed: Value = serde_json::from_str(raw).ok()?;
-    parsed
-        .as_array()
-        .and_then(|arr| arr.first())
-        .and_then(|x| x.as_str())
-        .map(|s| s.to_string())
+/// 万能价格提取：用 $ 后紧跟 [0-9,.]+ 的 pattern，在 title/description/question 里找第一个匹配，去逗号转 f64。
+fn strike_from_dollar_pattern(market: &Value) -> Option<f64> {
+    let fields = ["title", "description", "question"];
+    for key in fields {
+        let s = match market.get(key).and_then(|v| v.as_str()) {
+            Some(s) => s,
+            None => continue,
+        };
+        let after_dollar = match s.split('$').nth(1) {
+            Some(a) => a,
+            None => continue,
+        };
+        let num_str: String = after_dollar
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.' || *c == ',')
+            .collect();
+        let normalized = num_str.replace(',', "");
+        if normalized.is_empty() {
+            continue;
+        }
+        if let Ok(n) = normalized.parse::<f64>() {
+            return Some(n);
+        }
+    }
+    None
+}
+
+/// Gamma API 可能返回数组或字符串形式的 JSON 数组（带转义），统一解析为 Vec<String>。
+fn get_string_array_from_field(obj: &Value, field: &str) -> Option<Vec<String>> {
+    let val = obj.get(field)?;
+    if let Some(arr) = val.as_array() {
+        let v: Vec<String> = arr
+            .iter()
+            .filter_map(|e| e.as_str().map(String::from))
+            .collect();
+        return if v.is_empty() { None } else { Some(v) };
+    }
+    if let Some(s) = val.as_str() {
+        let parsed: Value = serde_json::from_str(s).ok()?;
+        let arr = parsed.as_array()?;
+        let v: Vec<String> = arr
+            .iter()
+            .filter_map(|e| e.as_str().map(String::from))
+            .collect();
+        return if v.is_empty() { None } else { Some(v) };
+    }
+    None
+}
+
+/// 兼容 Yes/No 与 Up/Down：Yes 或 Up 视为看涨（CALL），取对应 token 作为 YES。
+/// clobTokenIds / outcomes 支持直接数组或字符串形式的 JSON 数组。
+fn extract_yes_token_id(v: &Value) -> Option<String> {
+    let ids: Vec<String> = get_string_array_from_field(v, "clobTokenIds")?;
+    let outcomes = get_string_array_from_field(v, "outcomes").unwrap_or_default();
+    for (i, out) in outcomes.iter().enumerate() {
+        let lower = out.to_lowercase();
+        if lower == "yes" || lower == "up" {
+            if let Some(tok) = ids.get(i) {
+                return Some(tok.clone());
+            }
+        }
+    }
+    // 强制绑定：找不到 Yes/Up 时认定 index 0 = YES，index 1 = NO
+    ids.into_iter().next()
 }
 
 pub async fn fetch_event_markets(slug: &str) -> Result<Vec<MarketInfo>, Box<dyn Error>> {
@@ -101,34 +176,52 @@ pub async fn fetch_event_markets(slug: &str) -> Result<Vec<MarketInfo>, Box<dyn 
         };
 
         for market in markets {
-            let active = market
-                .get("active")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false);
-            let closed = market
-                .get("closed")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            if !active || closed {
-                continue;
+            if let Ok(json_str) = serde_json::to_string(market) {
+                info!("[Radar] market raw JSON: {}", json_str);
             }
 
+            // 强制放宽：暂时移除 active/closed 过滤，slug 匹配就进解析
             let Some(token_id) = extract_yes_token_id(market) else {
                 continue;
             };
 
-            let strike_price = parse_f64_field(market.get("line")).or_else(|| {
-                market
-                    .get("groupItemTitle")
-                    .and_then(|v| v.as_str())
-                    .and_then(parse_number_from_text)
+            let strike_from_api = parse_f64_field(market.get("line"))
+                .or_else(|| {
+                    market
+                        .get("groupItemTitle")
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_number_from_text)
+                })
+                .or_else(|| strike_from_dollar_pattern(market))
+                .or_else(|| {
+                    market
+                        .get("description")
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_strike_from_description)
+                })
+                .or_else(|| {
+                    market
+                        .get("question")
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_strike_from_description)
+                })
+                .or_else(|| {
+                    market
+                        .get("title")
+                        .and_then(|v| v.as_str())
+                        .and_then(parse_strike_from_description)
+                });
+            let target_ts = parse_expiry_from_slug(slug);
+            let mut strike_price = strike_from_api.unwrap_or_else(|| {
+                target_ts
+                    .and_then(btc_price::get_btc_at_timestamp)
+                    .unwrap_or_else(btc_price::get_btc_mid)
             });
-            let Some(mut strike_price) = strike_price else {
-                continue;
-            };
             if strike_price < 1000.0 && strike_price > 10.0 {
                 strike_price *= 1000.0;
             }
+            let is_relative_strike = strike_from_api.is_none();
+            let strike_timestamp = if is_relative_strike { target_ts } else { None };
 
             let Some(end_date) = market.get("endDate").and_then(|v| v.as_str()) else {
                 continue;
@@ -139,6 +232,8 @@ pub async fn fetch_event_markets(slug: &str) -> Result<Vec<MarketInfo>, Box<dyn 
                 token_id,
                 strike_price,
                 expiry_timestamp,
+                is_relative_strike,
+                strike_timestamp,
             });
         }
     }
@@ -148,6 +243,7 @@ pub async fn fetch_event_markets(slug: &str) -> Result<Vec<MarketInfo>, Box<dyn 
 
 /// Parses expiry timestamp from slug (e.g. "btc-updown-5m-1734567890" -> 1734567890).
 /// Returns None if slug does not end with a unix timestamp.
+#[allow(dead_code)]
 fn parse_expiry_from_slug(slug: &str) -> Option<i64> {
     let last = slug.rsplit('-').next()?;
     if last.len() == 10 && last.bytes().all(|b| b.is_ascii_digit()) {
@@ -157,6 +253,7 @@ fn parse_expiry_from_slug(slug: &str) -> Option<i64> {
 }
 
 /// Fetches one page of events from Gamma (no slug filter). Used by 5m radar.
+#[allow(dead_code)]
 async fn fetch_events_page(limit: u32, offset: u32) -> Result<Vec<Value>, Box<dyn Error>> {
     let url = "https://gamma-api.polymarket.com/events";
     let limit_s = limit.to_string();
@@ -180,6 +277,7 @@ async fn fetch_events_page(limit: u32, offset: u32) -> Result<Vec<Value>, Box<dy
 
 /// 5 分钟高频雷达：拉取包含 "updown-5m" 的活跃事件，只保留 1～3 分钟内到期的市场。
 /// 供外部每 1 分钟定时调用（如 interval tick）。
+#[allow(dead_code)]
 pub async fn fetch_updown_5m_markets_near_expiry() -> Result<Vec<MarketInfo>, Box<dyn Error>> {
     let now = chrono::Utc::now().timestamp();
     let min_expiry = now + 60;   // 至少 1 分钟后到期
@@ -223,12 +321,31 @@ pub async fn fetch_updown_5m_markets_near_expiry() -> Result<Vec<MarketInfo>, Bo
                 let Some(token_id) = extract_yes_token_id(market) else {
                     continue;
                 };
-                let strike_price = parse_f64_field(market.get("line")).or_else(|| {
-                    market
-                        .get("groupItemTitle")
-                        .and_then(|v| v.as_str())
-                        .and_then(parse_number_from_text)
-                });
+                let strike_price = parse_f64_field(market.get("line"))
+                    .or_else(|| {
+                        market
+                            .get("groupItemTitle")
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_number_from_text)
+                    })
+                    .or_else(|| {
+                        market
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_strike_from_description)
+                    })
+                    .or_else(|| {
+                        market
+                            .get("question")
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_strike_from_description)
+                    })
+                    .or_else(|| {
+                        market
+                            .get("title")
+                            .and_then(|v| v.as_str())
+                            .and_then(parse_strike_from_description)
+                    });
                 let Some(mut strike_price) = strike_price else {
                     continue;
                 };
@@ -243,6 +360,8 @@ pub async fn fetch_updown_5m_markets_near_expiry() -> Result<Vec<MarketInfo>, Bo
                     token_id,
                     strike_price,
                     expiry_timestamp,
+                    is_relative_strike: false,
+                    strike_timestamp: None,
                 });
             }
         }
@@ -256,6 +375,7 @@ pub async fn fetch_updown_5m_markets_near_expiry() -> Result<Vec<MarketInfo>, Bo
 
 /// Checks if the Polymarket event for the given slug exists (API returns 200 with events).
 /// Returns Ok(false) on 404 or empty response so caller can retry later.
+#[allow(dead_code)]
 pub async fn check_event_exists(slug: &str) -> Result<bool, Box<dyn Error>> {
     let url = format!("https://gamma-api.polymarket.com/events?slug={slug}");
     let resp = get_client().get(&url).send().await?;
