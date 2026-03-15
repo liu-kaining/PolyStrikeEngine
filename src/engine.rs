@@ -119,6 +119,7 @@ fn iceberg_chunk_sizes(total_size: f64, price: f64) -> Vec<f64> {
 
 #[derive(Debug, Clone)]
 struct ExecutedOrderUpdate {
+    token_id: String,
     side: OrderSide,
     price: f64,
     size: f64,
@@ -130,20 +131,21 @@ struct ExecutedOrderUpdate {
 
 struct StrategyGuardDrop {
     strategies: Arc<StrategyRegistry>,
-    token_id: String,
+    market_key: String,
 }
 
 impl Drop for StrategyGuardDrop {
     fn drop(&mut self) {
-        self.strategies.deregister(&self.token_id);
+        self.strategies.deregister(&self.market_key);
     }
 }
 
 enum PositionState {
     Empty,
-    PendingBuy { entered_at: Instant },
-    Holding { buy_price: f64, amount: f64 },
+    PendingBuy { #[allow(dead_code)] token_id: String, entered_at: Instant },
+    Holding { token_id: String, buy_price: f64, amount: f64 },
     PendingSell {
+        token_id: String,
         buy_price: f64,
         amount: f64,
         amount_trying_to_sell: f64,
@@ -151,10 +153,11 @@ enum PositionState {
     },
 }
 
-/// Runs a single sniper loop for one market.
-/// All expensive resources (PolyClient, Binance WS) are injected as singletons.
+/// Runs a single sniper loop for one market (both Up and Down tokens).
+/// Listens to both orderbooks and buys whichever side has the best edge.
 pub async fn run_sniper_task(
-    token_id: String,
+    yes_token_id: String,
+    no_token_id: String,
     strike_price: f64,
     snipe_size: f64,
     expiry_timestamp: i64,
@@ -162,6 +165,8 @@ pub async fn run_sniper_task(
     is_relative_strike: bool,
     strike_timestamp: Option<i64>,
     basis_adjustment: f64,
+    binance_kline_time: Option<i64>,
+    binance_kline_close: Option<f64>,
     dry_run: bool,
     inventory: Arc<InventoryManager>,
     risk_guard: Arc<RiskGuard>,
@@ -170,9 +175,10 @@ pub async fn run_sniper_task(
     cancel_token: CancellationToken,
     strategies: Arc<StrategyRegistry>,
 ) {
+    let market_key = yes_token_id.clone();
     let _guard = StrategyGuardDrop {
         strategies: strategies.clone(),
-        token_id: token_id.clone(),
+        market_key: market_key.clone(),
     };
 
     let sniper_strategy =
@@ -180,10 +186,17 @@ pub async fn run_sniper_task(
 
     let mut binance_rx = binance_rx;
 
-    let mut poly_rx = match poly_ws::spawn_poly_orderbook_stream(&token_id) {
+    let mut poly_yes_rx = match poly_ws::spawn_poly_orderbook_stream(&yes_token_id) {
         Ok(rx) => rx,
         Err(e) => {
-            error!("[Engine] {} Polymarket stream failed: {}", token_id, e);
+            error!("[Engine] {} Poly stream failed: {}", yes_token_id, e);
+            return;
+        }
+    };
+    let mut poly_no_rx = match poly_ws::spawn_poly_orderbook_stream(&no_token_id) {
+        Ok(rx) => rx,
+        Err(e) => {
+            error!("[Engine] {} Poly stream failed: {}", no_token_id, e);
             return;
         }
     };
@@ -191,21 +204,18 @@ pub async fn run_sniper_task(
     let mut last_price = 0.0_f64;
     let mut first_tick = true;
     let wait_duration = Duration::from_secs(5);
-    let mut current_position = sync_current_position(
-        token_id.as_str(),
-        inventory.as_ref(),
-        poly_client.as_deref(),
-    )
-    .await;
+    let pos_yes = sync_current_position(yes_token_id.as_str(), inventory.as_ref(), poly_client.as_deref()).await;
+    let pos_no = sync_current_position(no_token_id.as_str(), inventory.as_ref(), poly_client.as_deref()).await;
 
-    let mut state = if current_position > 0.0 {
-        PositionState::Holding {
-            buy_price: 0.0,
-            amount: current_position,
-        }
+    let mut state = if pos_yes > 0.0 {
+        PositionState::Holding { token_id: yes_token_id.clone(), buy_price: 0.0, amount: pos_yes }
+    } else if pos_no > 0.0 {
+        PositionState::Holding { token_id: no_token_id.clone(), buy_price: 0.0, amount: pos_no }
     } else {
         PositionState::Empty
     };
+    #[allow(unused_assignments)]
+    let mut current_position = 0.0_f64;
 
     let (fill_tx, mut fill_rx) = mpsc::channel::<ExecutedOrderUpdate>(1024);
     let mut last_order_fail: Option<Instant> = None;
@@ -230,6 +240,15 @@ pub async fn run_sniper_task(
     } else {
         info!("[Engine] 🎯 Monitoring K={:.0}{}", strike_price, relative_tag);
     }
+    if let (Some(kline_sec), Some(close)) = (binance_kline_time, binance_kline_close) {
+        let time_str = chrono::DateTime::from_timestamp(kline_sec, 0)
+            .map(|dt| dt.format("%H:%M:%S").to_string())
+            .unwrap_or_else(|| kline_sec.to_string());
+        debug!(
+            "[Debug] Binance 1m Kline time: {}, Close: {:.2}",
+            time_str, close
+        );
+    }
 
     loop {
         tokio::select! {
@@ -245,11 +264,13 @@ pub async fn run_sniper_task(
                         let total_pnl = inventory.get_total_realized_pnl();
                         risk_guard.update_circuit_breaker(total_pnl);
                         last_order_fail = None;
+                        let side_tag = if update.token_id == yes_token_id { "Up" } else { "Down" };
                         info!(
-                            "[HFT-ENTER] ⚡ K={:.0} | Bought at {:.3} | Edge:{:.4} | Size:{:.2}",
-                            strike_price, update.price, update.edge_hint, update.size,
+                            "[HFT-ENTER] ⚡ K={:.0} | {} | Bought at {:.3} | Edge:{:.4} | Size:{:.2}",
+                            strike_price, side_tag, update.price, update.edge_hint, update.size,
                         );
                         PositionState::Holding {
+                            token_id: update.token_id,
                             buy_price: update.price,
                             amount: update.size,
                         }
@@ -262,44 +283,42 @@ pub async fn run_sniper_task(
                             );
                         }
                         last_order_fail = Some(Instant::now());
+                        risk_guard.release_token_buy_slot(&market_key);
                         PositionState::Empty
                     }
-                    (PositionState::PendingSell { buy_price, .. }, OrderSide::Sell, true) => {
+                    (PositionState::PendingSell { token_id, buy_price, .. }, OrderSide::Sell, true) => {
                         let profit = update.price - buy_price;
                         let total_pnl = inventory.get_total_realized_pnl();
                         risk_guard.update_circuit_breaker(total_pnl);
                         last_order_fail = None;
+                        let side_tag = if token_id == yes_token_id { "Up" } else { "Down" };
                         info!(
-                            "[HFT-EXIT] 💰 K={:.0} | Sold at {:.3} | Buy:{:.3} | Profit:{:.4}",
-                            strike_price, update.price, buy_price, profit,
+                            "[HFT-EXIT] 💰 K={:.0} | {} | Sold at {:.3} | Buy:{:.3} | Profit:{:.4}",
+                            strike_price, side_tag, update.price, buy_price, profit,
                         );
                         if current_position > 0.0 {
-                            PositionState::Holding { buy_price, amount: current_position }
+                            PositionState::Holding { token_id, buy_price, amount: current_position }
                         } else {
                             PositionState::Empty
                         }
                     }
-                    (PositionState::PendingSell { buy_price, amount, amount_trying_to_sell, .. }, OrderSide::Sell, false) => {
+                    (PositionState::PendingSell { token_id, buy_price, amount, amount_trying_to_sell, .. }, OrderSide::Sell, false) => {
                         info!(
                             "[HFT-EXIT] ❌ K={:.0} | Sell failed at {:.3} | Buy:{:.3} | Size:{:.2} | Cooldown {}s",
                             strike_price, update.price, buy_price, amount_trying_to_sell, order_fail_cooldown_secs(),
                         );
                         last_order_fail = Some(Instant::now());
-                        PositionState::Holding { buy_price, amount }
+                        PositionState::Holding { token_id, buy_price, amount }
                     }
                     (s, _, _) => s,
                 };
             }
 
             _ = cancel_token.cancelled() => {
-                info!("[Engine] Strategy for {} stopping — cancelling open orders...", token_id);
-                // Best-effort cancel all open orders for this token before exiting
+                info!("[Engine] Market K={:.0} stopping — cancelling open orders...", strike_price);
                 if let Some(ref client) = poly_client {
-                    if let Err(e) = client.cancel_all_orders(&token_id).await {
-                        warn!("[Engine] {} cancel_all_orders failed: {}", token_id, e);
-                    } else {
-                        info!("[Engine] {} open orders cancelled.", token_id);
-                    }
+                    let _ = client.cancel_all_orders(&yes_token_id).await;
+                    let _ = client.cancel_all_orders(&no_token_id).await;
                 }
                 break;
             }
@@ -316,22 +335,24 @@ pub async fn run_sniper_task(
                     info!("[Engine] K={:.0} waiting for Poly WS first tick...", strike_price);
                 }
                 match &state {
-                    PositionState::PendingBuy { entered_at } => {
+                    PositionState::PendingBuy { entered_at, .. } => {
                         if entered_at.elapsed() > Duration::from_secs(pending_watchdog_secs()) {
                             warn!(
                                 "[Watchdog] ⏰ K={:.0} PendingBuy stuck for {}s, force-unlocking to Empty",
                                 strike_price, entered_at.elapsed().as_secs()
                             );
+                            risk_guard.release_token_buy_slot(&market_key);
                             state = PositionState::Empty;
                         }
                     }
-                    PositionState::PendingSell { buy_price, amount, entered_at, .. } => {
+                    PositionState::PendingSell { token_id, buy_price, amount, entered_at, .. } => {
                         if entered_at.elapsed() > Duration::from_secs(pending_watchdog_secs()) {
                             warn!(
                                 "[Watchdog] ⏰ K={:.0} PendingSell stuck for {}s, force-unlocking to Holding",
                                 strike_price, entered_at.elapsed().as_secs()
                             );
                             state = PositionState::Holding {
+                                token_id: token_id.clone(),
                                 buy_price: *buy_price,
                                 amount: *amount,
                             };
@@ -343,7 +364,7 @@ pub async fn run_sniper_task(
 
             changed = binance_rx.changed() => {
                 if changed.is_err() {
-                    error!("[Engine] {} Binance WS sender dropped, suspending task.", token_id);
+                    error!("[Engine] K={:.0} Binance WS sender dropped.", strike_price);
                     break;
                 }
                 let ticker = *binance_rx.borrow();
@@ -355,34 +376,85 @@ pub async fn run_sniper_task(
                 if (binance_mid - last_price).abs() > f64::EPSILON {
                     last_price = binance_mid;
                 }
-                let poly_book = *poly_rx.borrow();
+                let book_yes = *poly_yes_rx.borrow();
+                let book_no = *poly_no_rx.borrow();
+                current_position = match &state {
+                    PositionState::Holding { token_id, .. } if token_id == &yes_token_id => {
+                        sync_current_position(&yes_token_id, inventory.as_ref(), poly_client.as_deref()).await
+                    }
+                    PositionState::Holding { token_id, .. } if token_id == &no_token_id => {
+                        sync_current_position(&no_token_id, inventory.as_ref(), poly_client.as_deref()).await
+                    }
+                    _ => 0.0,
+                };
 
                 tick_count += 1;
                 evaluate_and_act(
                     &mut state, &sniper_strategy, binance_mid,
-                    poly_book.best_ask, poly_book.best_bid,
+                    book_yes.best_ask, book_yes.best_bid,
+                    book_no.best_ask, book_no.best_bid,
                     current_position, strike_price, is_relative_strike, dry_run,
-                    &token_id, &risk_guard, &inventory, &poly_client, &fill_tx,
+                    &yes_token_id, &no_token_id, &market_key, &risk_guard, &inventory, &poly_client, &fill_tx,
                     &last_order_fail, tick_count,
                 ).await;
             }
 
-            changed = poly_rx.changed() => {
+            changed = poly_yes_rx.changed() => {
                 if changed.is_err() {
-                    error!("[Engine] {} Poly WS sender dropped, suspending task.", token_id);
+                    error!("[Engine] K={:.0} Poly Yes WS dropped.", strike_price);
                     break;
                 }
                 let ticker = *binance_rx.borrow();
                 let binance_mid = (ticker.bid_price + ticker.ask_price) * 0.5;
-                btc_price::set_btc_mid(binance_mid);
-                let poly_book = *poly_rx.borrow();
+                let book_yes = *poly_yes_rx.borrow();
+                let book_no = *poly_no_rx.borrow();
+                current_position = match &state {
+                    PositionState::Holding { token_id, .. } if token_id == &yes_token_id => {
+                        sync_current_position(&yes_token_id, inventory.as_ref(), poly_client.as_deref()).await
+                    }
+                    PositionState::Holding { token_id, .. } if token_id == &no_token_id => {
+                        sync_current_position(&no_token_id, inventory.as_ref(), poly_client.as_deref()).await
+                    }
+                    _ => 0.0,
+                };
 
                 tick_count += 1;
                 evaluate_and_act(
                     &mut state, &sniper_strategy, binance_mid,
-                    poly_book.best_ask, poly_book.best_bid,
+                    book_yes.best_ask, book_yes.best_bid,
+                    book_no.best_ask, book_no.best_bid,
                     current_position, strike_price, is_relative_strike, dry_run,
-                    &token_id, &risk_guard, &inventory, &poly_client, &fill_tx,
+                    &yes_token_id, &no_token_id, &market_key, &risk_guard, &inventory, &poly_client, &fill_tx,
+                    &last_order_fail, tick_count,
+                ).await;
+            }
+
+            changed = poly_no_rx.changed() => {
+                if changed.is_err() {
+                    error!("[Engine] K={:.0} Poly No WS dropped.", strike_price);
+                    break;
+                }
+                let ticker = *binance_rx.borrow();
+                let binance_mid = (ticker.bid_price + ticker.ask_price) * 0.5;
+                let book_yes = *poly_yes_rx.borrow();
+                let book_no = *poly_no_rx.borrow();
+                current_position = match &state {
+                    PositionState::Holding { token_id, .. } if token_id == &yes_token_id => {
+                        sync_current_position(&yes_token_id, inventory.as_ref(), poly_client.as_deref()).await
+                    }
+                    PositionState::Holding { token_id, .. } if token_id == &no_token_id => {
+                        sync_current_position(&no_token_id, inventory.as_ref(), poly_client.as_deref()).await
+                    }
+                    _ => 0.0,
+                };
+
+                tick_count += 1;
+                evaluate_and_act(
+                    &mut state, &sniper_strategy, binance_mid,
+                    book_yes.best_ask, book_yes.best_bid,
+                    book_no.best_ask, book_no.best_bid,
+                    current_position, strike_price, is_relative_strike, dry_run,
+                    &yes_token_id, &no_token_id, &market_key, &risk_guard, &inventory, &poly_client, &fill_tx,
                     &last_order_fail, tick_count,
                 ).await;
             }
@@ -399,18 +471,48 @@ fn enter_threshold_effective(is_relative_strike: bool) -> f64 {
     }
 }
 
+/// Dual-side edges: fv_yes (binary call), fv_no = 1 - fv_yes; edge_yes, edge_no (buy), sell_edge_yes, sell_edge_no.
+fn compute_edges_dual(
+    strategy: &SniperStrategy,
+    binance_mid: f64,
+    best_ask_yes: f64,
+    best_bid_yes: f64,
+    best_ask_no: f64,
+    best_bid_no: f64,
+) -> (f64, f64, f64, f64, f64, f64) {
+    let now = Utc::now().timestamp();
+    let remaining_seconds = (strategy.expiry_timestamp - now).max(0);
+    let time_to_expiry_years = remaining_seconds as f64 / (365.0 * 24.0 * 3600.0);
+    let fv_yes = SniperStrategy::calculate_binary_call_price(
+        binance_mid,
+        strategy.strike_price,
+        time_to_expiry_years,
+        strategy.volatility,
+    );
+    let fv_no = 1.0 - fv_yes;
+    let edge_yes = if best_ask_yes > 0.0 { fv_yes - best_ask_yes } else { f64::MIN };
+    let edge_no = if best_ask_no > 0.0 { fv_no - best_ask_no } else { f64::MIN };
+    let sell_edge_yes = if best_bid_yes > 0.0 { best_bid_yes - fv_yes } else { f64::MIN };
+    let sell_edge_no = if best_bid_no > 0.0 { best_bid_no - fv_no } else { f64::MIN };
+    (fv_yes, fv_no, edge_yes, edge_no, sell_edge_yes, sell_edge_no)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn evaluate_and_act(
     state: &mut PositionState,
     sniper_strategy: &SniperStrategy,
     binance_mid: f64,
-    best_ask: f64,
-    best_bid: f64,
+    best_ask_yes: f64,
+    best_bid_yes: f64,
+    best_ask_no: f64,
+    best_bid_no: f64,
     current_position: f64,
     strike_price: f64,
     is_relative_strike: bool,
     dry_run: bool,
-    token_id: &str,
+    yes_token_id: &str,
+    no_token_id: &str,
+    market_key: &str,
     risk_guard: &Arc<RiskGuard>,
     inventory: &Arc<InventoryManager>,
     poly_client: &Option<Arc<PolyClient>>,
@@ -418,8 +520,6 @@ async fn evaluate_and_act(
     last_order_fail: &Option<Instant>,
     tick_count: u64,
 ) {
-    // When Empty: if available cash is below ~$1, hibernate to avoid "not enough balance" spam.
-    // When Holding/Pending*: never skip — we must always allow selling (no cash needed).
     if matches!(state, PositionState::Empty) {
         let max_budget = risk_guard.max_budget_f64();
         if max_budget > 0.0 {
@@ -449,12 +549,11 @@ async fn evaluate_and_act(
         }
     }
 
-    let (fair_value, buy_edge, sell_edge) =
-        compute_edges(sniper_strategy, binance_mid, best_ask, best_bid);
+    let (fv_yes, fv_no, edge_yes, edge_no, sell_edge_yes, sell_edge_no) =
+        compute_edges_dual(sniper_strategy, binance_mid, best_ask_yes, best_bid_yes, best_ask_no, best_bid_no);
 
-    // Only log markets with meaningful edge or liquidity (reduce noise)
-    let is_interesting = buy_edge > -0.01 && (best_bid > 0.01 || best_ask < 0.99);
-    if tick_count % edge_monitor_interval() == 0 && best_ask > 0.0 && is_interesting {
+    let is_interesting = edge_yes > -0.01 || edge_no > -0.01;
+    if tick_count % edge_monitor_interval() == 0 && is_interesting {
         let state_tag = match state {
             PositionState::Empty => "EMPTY",
             PositionState::PendingBuy { .. } => "P-BUY",
@@ -463,8 +562,9 @@ async fn evaluate_and_act(
         };
         let thr = enter_threshold_effective(is_relative_strike);
         info!(
-            "[Monitor] K={:.0} | FV:{:.4} Ask:{:.3} Bid:{:.3} | BuyEdge:{:.4} SellEdge:{:.4} | Thr:{:.3} | State:{} | BTC:{:.1}",
-            strike_price, fair_value, best_ask, best_bid, buy_edge, sell_edge, thr, state_tag, binance_mid,
+            "[Monitor] K={:.0} | FV_yes:{:.4} FV_no:{:.4} | AskY:{:.3} BidY:{:.3} AskN:{:.3} BidN:{:.3} | EdgeY:{:.4} EdgeN:{:.4} | Thr:{:.3} | State:{} | BTC:{:.1}",
+            strike_price, fv_yes, fv_no, best_ask_yes, best_bid_yes, best_ask_no, best_bid_no,
+            edge_yes, edge_no, thr, state_tag, binance_mid,
         );
     }
 
@@ -478,137 +578,140 @@ async fn evaluate_and_act(
             }
 
             let thr_eff = enter_threshold_effective(is_relative_strike);
-            if best_ask > 0.0 && buy_edge > thr_eff {
-                if best_ask > max_buy_price() {
-                    if tick_count % edge_monitor_interval() == 0 {
-                        debug!(
-                            "[Skipped] K={:.0} | Reason: ask {:.3} > MAX_BUY_PRICE {:.2}",
-                            strike_price, best_ask, max_buy_price(),
-                        );
-                    }
-                    return;
-                }
-                // Interpret snipe_size as USD budget per shot.
-                let budget_per_trade = sniper_strategy.snipe_size;
-                let shares_to_buy = (budget_per_trade / best_ask).floor();
+            let (buy_token_id, best_ask, buy_edge, fair_val) = if edge_yes >= edge_no && edge_yes > thr_eff && best_ask_yes > 0.0 && best_ask_yes <= max_buy_price() {
+                (yes_token_id, best_ask_yes, edge_yes, fv_yes)
+            } else if edge_no > thr_eff && best_ask_no > 0.0 && best_ask_no <= max_buy_price() {
+                (no_token_id, best_ask_no, edge_no, fv_no)
+            } else {
+                return;
+            };
 
-                // Require at least 1 share notionally.
-                if shares_to_buy < 1.0 {
-                    if tick_count % edge_monitor_interval() == 0 {
-                        debug!(
-                            "[Skipped] K={:.0} | Reason: budget per trade too small | Budget:{:.4} Ask:{:.4}",
-                            strike_price, budget_per_trade, best_ask,
-                        );
-                    }
-                    return;
+            let budget_per_trade = sniper_strategy.snipe_size;
+            let shares_to_buy = (budget_per_trade / best_ask).floor();
+            if shares_to_buy < 1.0 {
+                if tick_count % edge_monitor_interval() == 0 {
+                    debug!(
+                        "[Skipped] K={:.0} | Reason: budget per trade too small | Budget:{:.4} Ask:{:.4}",
+                        strike_price, budget_per_trade, best_ask,
+                    );
                 }
-
-                let notional = shares_to_buy * best_ask;
-                // Polymarket minimum order notional is ~$1.
-                if notional < 1.0 {
-                    if tick_count % edge_monitor_interval() == 0 {
-                        debug!(
-                            "[Skipped] K={:.0} | Reason: notional < $1.0 | Notional:{:.4}",
-                            strike_price, notional,
-                        );
-                    }
-                    return;
-                }
-
-                let (yes_qty, no_qty) = inventory.get_exposure_qty(token_id);
-                if risk_guard
-                    .check_market_exposure(yes_qty + shares_to_buy, no_qty)
-                    .is_err()
-                {
-                    if tick_count % edge_monitor_interval() == 0 {
-                        debug!(
-                            "[Skipped] K={:.0} | Reason: market exposure limit | yes:{:.2} no:{:.2}",
-                            strike_price, yes_qty, no_qty,
-                        );
-                    }
-                    return;
-                }
-
-                // Strict single-shot protection: if ANY market currently has a BUY in-flight,
-                // we must not trigger another BUY. This enforces "one bullet at a time"
-                // for very small accounts.
-                if !risk_guard.try_acquire_global_buy_slot() {
-                    if tick_count % edge_monitor_interval() == 0 {
-                        debug!(
-                            "[Skipped] K={:.0} | Reason: global PendingBuy in another market",
-                            strike_price
-                        );
-                    }
-                    return;
-                }
-                // 同一 token 只允许 1 个活跃订单：已有 Pending 则不再 spawn
-                if !risk_guard.try_acquire_token_buy_slot(token_id) {
-                    risk_guard.release_global_buy_slot();
-                    if tick_count % edge_monitor_interval() == 0 {
-                        debug!(
-                            "[Skipped] K={:.0} | Reason: token already has PendingBuy",
-                            strike_price
-                        );
-                    }
-                    return;
-                }
-
-                // Check that the USD budget per shot fits inside remaining global budget.
-                if !risk_guard.can_afford(1.0, sniper_strategy.snipe_size) {
-                    // We acquired the global slot but cannot afford; release immediately.
-                    risk_guard.release_global_buy_slot();
-                    if tick_count % edge_monitor_interval() == 0 {
-                        let spent = risk_guard.current_spent();
-                        debug!(
-                            "[Skipped] K={:.0} | Reason: budget | Need:{:.2} Spent:{} Max:{}",
-                            strike_price,
-                            sniper_strategy.snipe_size,
-                            spent,
-                            risk_guard.max_budget_f64(),
-                        );
-                    }
-                    return;
-                }
-                info!(
-                    "[TRIGGER] K={:.0} | Edge:{:.4} > Thr:{:.3} | Ask:{:.3} FV:{:.4} | Spawning order...",
-                    strike_price, buy_edge, thr_eff, best_ask, fair_value,
-                );
-                let signal = crate::strategy::SnipeSignal {
-                    side: OrderSide::Buy,
-                    target_price: best_ask,
-                    size: shares_to_buy,
-                };
-                tokio::spawn(try_fire(
-                    risk_guard.clone(), inventory.clone(), poly_client.clone(),
-                    token_id.to_string(), strike_price, signal,
-                    dry_run, fill_tx.clone(), buy_edge,
-                ));
-                *state = PositionState::PendingBuy { entered_at: Instant::now() };
+                return;
             }
+            let notional = shares_to_buy * best_ask;
+            if notional < 1.0 {
+                if tick_count % edge_monitor_interval() == 0 {
+                    debug!(
+                        "[Skipped] K={:.0} | Reason: notional < $1.0 | Notional:{:.4}",
+                        strike_price, notional,
+                    );
+                }
+                return;
+            }
+
+            let yes_qty = inventory.get_exposure_qty(yes_token_id).0;
+            let no_qty = inventory.get_exposure_qty(no_token_id).1;
+            let (add_yes, add_no) = if buy_token_id == yes_token_id {
+                (shares_to_buy, 0.0)
+            } else {
+                (0.0, shares_to_buy)
+            };
+            if risk_guard
+                .check_market_exposure(yes_qty + add_yes, no_qty + add_no)
+                .is_err()
+            {
+                if tick_count % edge_monitor_interval() == 0 {
+                    debug!(
+                        "[Skipped] K={:.0} | Reason: market exposure limit | yes:{:.2} no:{:.2}",
+                        strike_price, yes_qty + add_yes, no_qty + add_no,
+                    );
+                }
+                return;
+            }
+
+            if !risk_guard.try_acquire_global_buy_slot() {
+                if tick_count % edge_monitor_interval() == 0 {
+                    debug!(
+                        "[Skipped] K={:.0} | Reason: global PendingBuy in another market",
+                        strike_price
+                    );
+                }
+                return;
+            }
+            if !risk_guard.try_acquire_token_buy_slot(market_key) {
+                risk_guard.release_global_buy_slot();
+                if tick_count % edge_monitor_interval() == 0 {
+                    debug!(
+                        "[Skipped] K={:.0} | Reason: market already has PendingBuy",
+                        strike_price
+                    );
+                }
+                return;
+            }
+
+            if !risk_guard.can_afford(1.0, sniper_strategy.snipe_size) {
+                risk_guard.release_global_buy_slot();
+                risk_guard.release_token_buy_slot(market_key);
+                if tick_count % edge_monitor_interval() == 0 {
+                    let spent = risk_guard.current_spent();
+                    debug!(
+                        "[Skipped] K={:.0} | Reason: budget | Need:{:.2} Spent:{} Max:{}",
+                        strike_price, sniper_strategy.snipe_size, spent, risk_guard.max_budget_f64(),
+                    );
+                }
+                return;
+            }
+
+            let side_tag = if buy_token_id == yes_token_id { "Up" } else { "Down" };
+            info!(
+                "[TRIGGER] K={:.0} | {} | Edge:{:.4} > Thr:{:.3} | Ask:{:.3} FV:{:.4} | Spawning order...",
+                strike_price, side_tag, buy_edge, thr_eff, best_ask, fair_val,
+            );
+            let signal = crate::strategy::SnipeSignal {
+                side: OrderSide::Buy,
+                target_price: best_ask,
+                size: shares_to_buy,
+            };
+            tokio::spawn(try_fire(
+                risk_guard.clone(), inventory.clone(), poly_client.clone(),
+                buy_token_id.to_string(), market_key.to_string(), strike_price, signal,
+                dry_run, fill_tx.clone(), buy_edge,
+            ));
+            *state = PositionState::PendingBuy {
+                token_id: buy_token_id.to_string(),
+                entered_at: Instant::now(),
+            };
         }
-        PositionState::Holding { buy_price, amount } => {
+        PositionState::Holding { token_id, buy_price, amount } => {
+            let (best_bid, sell_edge) = if token_id == yes_token_id {
+                (best_bid_yes, sell_edge_yes)
+            } else {
+                (best_bid_no, sell_edge_no)
+            };
             if best_bid > 0.0 {
                 let profit = best_bid - *buy_price;
                 if sell_edge > exit_threshold() || profit > min_profit() {
                     let sell_size = (*amount).min(current_position).max(0.0);
                     if sell_size > 0.0 {
+                        let side_tag = if token_id == yes_token_id { "Up" } else { "Down" };
                         info!(
-                            "[TRIGGER-SELL] K={:.0} | SellEdge:{:.4} Profit:{:.4} | Bid:{:.3} BuyP:{:.3}",
-                            strike_price, sell_edge, profit, best_bid, buy_price,
+                            "[TRIGGER-SELL] K={:.0} | {} | SellEdge:{:.4} Profit:{:.4} | Bid:{:.3} BuyP:{:.3}",
+                            strike_price, side_tag, sell_edge, profit, best_bid, buy_price,
                         );
                         let signal = crate::strategy::SnipeSignal {
                             side: OrderSide::Sell,
                             target_price: best_bid,
                             size: sell_size,
                         };
+                        let tid = token_id.clone();
                         let bp = *buy_price;
                         let amt = *amount;
                         tokio::spawn(try_fire(
                             risk_guard.clone(), inventory.clone(), poly_client.clone(),
-                            token_id.to_string(), strike_price, signal,
+                            tid.clone(), market_key.to_string(), strike_price, signal,
                             dry_run, fill_tx.clone(), sell_edge,
                         ));
                         *state = PositionState::PendingSell {
+                            token_id: tid,
                             buy_price: bp,
                             amount: amt,
                             amount_trying_to_sell: sell_size,
@@ -641,26 +744,6 @@ async fn sync_current_position(
     inventory.get_net_exposure(token_id).max(0.0)
 }
 
-fn compute_edges(
-    strategy: &SniperStrategy,
-    binance_mid: f64,
-    best_ask: f64,
-    best_bid: f64,
-) -> (f64, f64, f64) {
-    let now = Utc::now().timestamp();
-    let remaining_seconds = (strategy.expiry_timestamp - now).max(0);
-    let time_to_expiry_years = remaining_seconds as f64 / (365.0 * 24.0 * 3600.0);
-    let fair_value = SniperStrategy::calculate_binary_call_price(
-        binance_mid,
-        strategy.strike_price,
-        time_to_expiry_years,
-        strategy.volatility,
-    );
-    let buy_edge = if best_ask > 0.0 { fair_value - best_ask } else { f64::MIN };
-    let sell_edge = if best_bid > 0.0 { best_bid - fair_value } else { f64::MIN };
-    (fair_value, buy_edge, sell_edge)
-}
-
 // INVARIANT: Every exit path MUST send an ExecutedOrderUpdate to fill_tx.
 
 #[allow(clippy::too_many_arguments)]
@@ -669,6 +752,7 @@ async fn try_fire(
     inventory: Arc<InventoryManager>,
     poly_client: Option<Arc<PolyClient>>,
     token_id: String,
+    market_key: String,
     strike_price: f64,
     signal: crate::strategy::SnipeSignal,
     dry_run: bool,
@@ -676,6 +760,7 @@ async fn try_fire(
     edge_hint: f64,
 ) {
     let fail_update = |reservation: Option<Arc<BudgetReservation>>| ExecutedOrderUpdate {
+        token_id: token_id.clone(),
         side: signal.side,
         price: signal.target_price,
         size: 0.0,
@@ -692,7 +777,7 @@ async fn try_fire(
                 debug!("[RiskGuard] ⛔ Budget rejected (race): {}", e);
                 if matches!(signal.side, OrderSide::Buy) {
                     risk_guard.release_global_buy_slot();
-                    risk_guard.release_token_buy_slot(&token_id);
+                    risk_guard.release_token_buy_slot(&market_key);
                 }
                 let _ = fill_tx.send(fail_update(None)).await;
                 return;
@@ -712,7 +797,7 @@ async fn try_fire(
         }
         if matches!(signal.side, OrderSide::Buy) {
             risk_guard.release_global_buy_slot();
-            risk_guard.release_token_buy_slot(&token_id);
+            risk_guard.release_token_buy_slot(&market_key);
         }
         let _ = fill_tx.send(fail_update(None)).await;
         return;
@@ -727,7 +812,7 @@ async fn try_fire(
         }
         if matches!(signal.side, OrderSide::Buy) {
             risk_guard.release_global_buy_slot();
-            risk_guard.release_token_buy_slot(&token_id);
+            risk_guard.release_token_buy_slot(&market_key);
         }
         let _ = fill_tx.send(fail_update(None)).await;
         return;
@@ -820,7 +905,7 @@ async fn try_fire(
         }
         if matches!(signal.side, OrderSide::Buy) {
             risk_guard.release_global_buy_slot();
-            risk_guard.release_token_buy_slot(&token_id);
+            risk_guard.release_token_buy_slot(&market_key);
         }
         let _ = fill_tx.send(fail_update(None)).await;
         return;
@@ -855,9 +940,10 @@ async fn try_fire(
         }
         if matches!(signal.side, OrderSide::Buy) {
             risk_guard.release_global_buy_slot();
-            risk_guard.release_token_buy_slot(&token_id);
+            risk_guard.release_token_buy_slot(&market_key);
         }
         let _ = fill_tx.send(ExecutedOrderUpdate {
+            token_id: token_id.clone(),
             side: signal.side,
             price: signal.target_price,
             size: 0.0,
@@ -884,6 +970,7 @@ async fn try_fire(
 
     let _ = fill_tx
         .send(ExecutedOrderUpdate {
+            token_id: token_id.clone(),
             side: signal.side,
             price: signal.target_price,
             size: actual_filled,
@@ -895,6 +982,6 @@ async fn try_fire(
         .await;
     if matches!(signal.side, OrderSide::Buy) {
         risk_guard.release_global_buy_slot();
-        risk_guard.release_token_buy_slot(&token_id);
+        risk_guard.release_token_buy_slot(&market_key);
     }
 }

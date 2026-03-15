@@ -2,6 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 use chrono::Utc;
+use tracing::debug;
 
 /// Global atomic BTC mid price, stored as f64 bits in an AtomicU64.
 static GLOBAL_BTC_MID_BITS: AtomicU64 = AtomicU64::new(0);
@@ -49,26 +50,42 @@ pub fn get_btc_at_timestamp(target_timestamp: i64) -> Option<f64> {
 
 const BINANCE_KLINES_URL: &str = "https://api.binance.com/api/v3/klines";
 
-/// 从 Binance REST 拉取指定时间所在那一分钟 K 线的开盘价；写入缓存并返回。
-/// 用于机器人刚启动、内存缓存为空时的补位。
-pub async fn fetch_historic_price_from_binance(ts: i64) -> Option<f64> {
-    let minute_ts = (ts / 60) * 60;
+/// 延迟偏移：不直接抓 eventStartTime 那一分钟，改为 +2 秒，确保 1m K 线已收盘且数据稳定。
+const KLINE_DELAY_OFFSET_SECS: i64 = 2;
+
+/// 从 Binance REST 拉取 eventStartTime 所在那一分钟 K 线的**收盘价**；写入缓存并返回。
+/// 使用 eventStartTime+2 秒的延迟偏移，确保币安 1m K 线已完全收盘。
+/// 通过 startTime/endTime 精准锁定该分钟，取 Close Price（index 4）。
+/// 返回 (close_price, kline_open_time_sec) 供调用方打 DEBUG 日志。
+pub async fn fetch_historic_price_from_binance(ts: i64) -> Option<(f64, i64)> {
+    let target_ts = ts + KLINE_DELAY_OFFSET_SECS;
+    let minute_ts = (target_ts / 60) * 60;
     let start_ms = minute_ts * 1000;
+    let end_ms = start_ms + 60_000 - 1;
     let url = format!(
-        "{}?symbol=BTCUSDT&interval=1m&startTime={}&limit=1",
-        BINANCE_KLINES_URL, start_ms
+        "{}?symbol=BTCUSDT&interval=1m&startTime={}&endTime={}&limit=1",
+        BINANCE_KLINES_URL, start_ms, end_ms
     );
     let client = reqwest::Client::new();
     let resp = client.get(&url).send().await.ok()?;
     let arr: Vec<serde_json::Value> = resp.json().await.ok()?;
     let row = arr.first()?;
-    let open_str = row.get(1)?.as_str()?;
-    let price: f64 = open_str.parse().ok()?;
-    record_price(minute_ts, price);
-    Some(price)
+    let open_time_ms = row.get(0)?.as_i64()?;
+    let close_str = row.get(4)?.as_str()?;
+    let close_price: f64 = close_str.parse().ok()?;
+    let kline_open_sec = open_time_ms / 1000;
+    record_price(kline_open_sec, close_price);
+    let time_str = chrono::DateTime::from_timestamp(kline_open_sec, 0)
+        .map(|dt| dt.format("%H:%M:%S").to_string())
+        .unwrap_or_else(|| kline_open_sec.to_string());
+    debug!(
+        "[Debug] Binance 1m Kline time: {}, Close: {:.2}",
+        time_str, close_price
+    );
+    Some((close_price, kline_open_sec))
 }
 
-/// 预热：拉取过去 15 分钟的 1m K 线开盘价写入缓存（Engine/Radar 启动时调用）。
+/// 预热：拉取过去 15 分钟的 1m K 线**收盘价**写入缓存（Engine/Radar 启动时调用）。
 pub async fn warmup_btc_cache_for_past_15_min(anchor_ts: i64) {
     let minute_ts = (anchor_ts / 60) * 60;
     let start_ms = (minute_ts - 14 * 60) * 1000;
@@ -82,8 +99,8 @@ pub async fn warmup_btc_cache_for_past_15_min(anchor_ts: i64) {
     for row in arr {
         let Some(open_time_ms) = row.get(0).and_then(|v| v.as_i64()) else { continue };
         let open_sec = open_time_ms / 1000;
-        let Some(open_str) = row.get(1).and_then(|v| v.as_str()) else { continue };
-        let Ok(price) = open_str.parse::<f64>() else { continue };
+        let Some(close_str) = row.get(4).and_then(|v| v.as_str()) else { continue };
+        let Ok(price) = close_str.parse::<f64>() else { continue };
         record_price(open_sec, price);
     }
 }

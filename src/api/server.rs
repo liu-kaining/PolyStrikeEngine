@@ -100,12 +100,16 @@ async fn strategy_start_handler(
         }
     });
 
+    let yes_token_id = token_id.clone();
+    let no_token_id = token_id;
     tokio::spawn(async move {
         engine::run_sniper_task(
-            token_id, strike_price, snipe_size, expiry_timestamp, volatility,
+            yes_token_id, no_token_id, strike_price, snipe_size, expiry_timestamp, volatility,
             false,
             None,
             0.0,
+            None,
+            None,
             dry_run, inventory, risk_guard, poly_client, binance_rx,
             combined_cancel, strategies,
         ).await;
@@ -146,6 +150,8 @@ pub async fn start_event_radar(
     binance_rx: watch::Receiver<BookTicker>,
     global_cancel: CancellationToken,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    tokio::time::sleep(tokio::time::Duration::from_secs(4)).await;
+
     let anchor_ts = radar::parse_expiry_from_slug(slug)
         .unwrap_or_else(|| chrono::Utc::now().timestamp());
     crate::models::btc_price::warmup_btc_cache_for_past_15_min(anchor_ts).await;
@@ -156,15 +162,19 @@ pub async fn start_event_radar(
     })?;
     let mut started = 0usize;
     for market in markets {
-        let Some(cancel_token) = strategies.try_register(market.token_id.clone()) else {
+        let market_key = market.yes_token_id.clone();
+        let Some(cancel_token) = strategies.try_register(market_key.clone()) else {
             continue;
         };
-        let token_id = market.token_id;
+        let yes_token_id = market.yes_token_id;
+        let no_token_id = market.no_token_id;
         let strike_price = market.strike_price;
         let expiry_timestamp = market.expiry_timestamp;
         let is_relative_strike = market.is_relative_strike;
         let strike_timestamp = market.strike_timestamp;
         let basis_adjustment = market.basis_adjustment;
+        let binance_kline_time = market.binance_kline_time;
+        let binance_kline_close = market.binance_kline_close;
         let inventory = inventory.clone();
         let risk_guard = risk_guard.clone();
         let strategies = strategies.clone();
@@ -183,8 +193,9 @@ pub async fn start_event_radar(
         });
         tokio::spawn(async move {
             engine::run_sniper_task(
-                token_id, strike_price, snipe_size, expiry_timestamp, volatility,
+                yes_token_id, no_token_id, strike_price, snipe_size, expiry_timestamp, volatility,
                 is_relative_strike, strike_timestamp, basis_adjustment,
+                binance_kline_time, binance_kline_close,
                 dry_run, inventory, risk_guard, poly_client, binance_rx,
                 combined_cancel, strategies,
             )

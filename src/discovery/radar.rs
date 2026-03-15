@@ -21,7 +21,8 @@ fn basis_adjustment() -> f64 {
 
 #[derive(Debug, Clone)]
 pub struct MarketInfo {
-    pub token_id: String,
+    pub yes_token_id: String,
+    pub no_token_id: String,
     pub strike_price: f64,
     pub expiry_timestamp: i64,
     /// 是否由“开盘价”补位得到的 strike（相对价盘口）
@@ -30,6 +31,9 @@ pub struct MarketInfo {
     pub strike_timestamp: Option<i64>,
     /// 已加上的基差校准值（Chainlink - Binance），用于日志显示
     pub basis_adjustment: f64,
+    /// DEBUG：当 strike 来自 Binance Kline 时，记录 K 线开盘时间（秒）和收盘价
+    pub binance_kline_time: Option<i64>,
+    pub binance_kline_close: Option<f64>,
 }
 
 static RADAR_CLIENT: OnceLock<Client> = OnceLock::new();
@@ -143,21 +147,27 @@ fn get_string_array_from_field(obj: &Value, field: &str) -> Option<Vec<String>> 
     None
 }
 
-/// 兼容 Yes/No 与 Up/Down：Yes 或 Up 视为看涨（CALL），取对应 token 作为 YES。
+/// 提取双 token：Up/Yes 与 Down/No。outcomes 映射到 clobTokenIds，返回 (yes_token_id, no_token_id)。
 /// clobTokenIds / outcomes 支持直接数组或字符串形式的 JSON 数组。
-fn extract_yes_token_id(v: &Value) -> Option<String> {
+fn extract_both_token_ids(v: &Value) -> Option<(String, String)> {
     let ids: Vec<String> = get_string_array_from_field(v, "clobTokenIds")?;
+    if ids.len() < 2 {
+        return None;
+    }
     let outcomes = get_string_array_from_field(v, "outcomes").unwrap_or_default();
+    let mut yes_idx = 0usize;
+    let mut no_idx = 1usize;
     for (i, out) in outcomes.iter().enumerate() {
         let lower = out.to_lowercase();
         if lower == "yes" || lower == "up" {
-            if let Some(tok) = ids.get(i) {
-                return Some(tok.clone());
-            }
+            yes_idx = i;
+        } else if lower == "no" || lower == "down" {
+            no_idx = i;
         }
     }
-    // 强制绑定：找不到 Yes/Up 时认定 index 0 = YES，index 1 = NO
-    ids.into_iter().next()
+    let yes_id = ids.get(yes_idx)?.clone();
+    let no_id = ids.get(no_idx)?.clone();
+    Some((yes_id, no_id))
 }
 
 pub async fn fetch_event_markets(slug: &str) -> Result<Vec<MarketInfo>, Box<dyn Error>> {
@@ -191,7 +201,7 @@ pub async fn fetch_event_markets(slug: &str) -> Result<Vec<MarketInfo>, Box<dyn 
             }
 
             // 强制放宽：暂时移除 active/closed 过滤，slug 匹配就进解析
-            let Some(token_id) = extract_yes_token_id(market) else {
+            let Some((yes_token_id, no_token_id)) = extract_both_token_ids(market) else {
                 continue;
             };
 
@@ -222,18 +232,19 @@ pub async fn fetch_event_markets(slug: &str) -> Result<Vec<MarketInfo>, Box<dyn 
                         .and_then(parse_strike_from_description)
                 });
             let target_ts = parse_expiry_from_slug(slug);
-            let mut strike_price = if let Some(s) = strike_from_api {
-                s
+            let (mut strike_price, binance_kline_time, binance_kline_close) = if let Some(s) = strike_from_api {
+                (s, None, None)
             } else {
                 let from_cache = target_ts.and_then(btc_price::get_btc_at_timestamp);
                 if let Some(p) = from_cache {
-                    p
+                    (p, None, None)
                 } else if let Some(ts) = target_ts {
-                    btc_price::fetch_historic_price_from_binance(ts)
-                        .await
-                        .unwrap_or_else(btc_price::get_btc_mid)
+                    match btc_price::fetch_historic_price_from_binance(ts).await {
+                        Some((p, kline_sec)) => (p, Some(kline_sec), Some(p)),
+                        None => (btc_price::get_btc_mid(), None, None),
+                    }
                 } else {
-                    btc_price::get_btc_mid()
+                    (btc_price::get_btc_mid(), None, None)
                 }
             };
             if strike_price < 1000.0 && strike_price > 10.0 {
@@ -243,8 +254,8 @@ pub async fn fetch_event_markets(slug: &str) -> Result<Vec<MarketInfo>, Box<dyn 
             strike_price += adj;
             if strike_price <= 0.0 {
                 warn!(
-                    "[Radar] Strike price is 0, skipping market to prevent false triggers. token_id={}",
-                    token_id
+                    "[Radar] Strike price is 0, skipping market to prevent false triggers. yes_token_id={}",
+                    yes_token_id
                 );
                 continue;
             }
@@ -257,12 +268,15 @@ pub async fn fetch_event_markets(slug: &str) -> Result<Vec<MarketInfo>, Box<dyn 
             let expiry_timestamp = DateTime::parse_from_rfc3339(end_date)?.timestamp();
 
             out.push(MarketInfo {
-                token_id,
+                yes_token_id,
+                no_token_id,
                 strike_price,
                 expiry_timestamp,
                 is_relative_strike,
                 strike_timestamp,
                 basis_adjustment: adj,
+                binance_kline_time,
+                binance_kline_close,
             });
         }
     }
@@ -346,7 +360,7 @@ pub async fn fetch_updown_5m_markets_near_expiry() -> Result<Vec<MarketInfo>, Bo
                 if !active || closed {
                     continue;
                 }
-                let Some(token_id) = extract_yes_token_id(market) else {
+                let Some((yes_token_id, no_token_id)) = extract_both_token_ids(market) else {
                     continue;
                 };
                 let strike_price = parse_f64_field(market.get("line"))
@@ -386,12 +400,15 @@ pub async fn fetch_updown_5m_markets_near_expiry() -> Result<Vec<MarketInfo>, Bo
                 let expiry_timestamp = DateTime::parse_from_rfc3339(end_date)?.timestamp();
                 let adj = basis_adjustment();
                 out.push(MarketInfo {
-                    token_id,
+                    yes_token_id,
+                    no_token_id,
                     strike_price: strike_price + adj,
                     expiry_timestamp,
                     is_relative_strike: false,
                     strike_timestamp: None,
                     basis_adjustment: adj,
+                    binance_kline_time: None,
+                    binance_kline_close: None,
                 });
             }
         }
